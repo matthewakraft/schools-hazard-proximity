@@ -1,0 +1,3385 @@
+---
+title: "PNAS TOXINS FINAL CODE"
+author: "Sohil Malik"
+date: "2026-07-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+# Load packages
+
+library(tidyverse)
+library(sf)
+library(scales)
+library(usmap)
+library(viridis)
+library(ggrepel)
+
+```
+
+# Step 1: Read in datasets
+```{r}
+# Schools
+public_school <- read.csv("Data/Schools/Public/public_school_combined.csv", 
+                           colClasses = c("School_ID" = "character"))
+
+private_school <- read.csv("Data/Schools/Private/private_school_combined.csv",
+                           colClasses = c("PPIN" = "character"))
+
+# TRI sites
+tri <- read.csv("Data/Pollution Sites/TRI/2024_us.csv",
+                colClasses = c("X2..TRIFD" = "character"))
+
+# Superfund sites 
+superfund <- read.csv("Data/Pollution Sites/Superfund/superfund_sites_with_coordinates_new.csv",
+                      colClasses = c("EPA.ID" = "character"))
+
+# Brownfield sites
+brownfield <- read.csv("Data/Pollution Sites/Brownfield/brownfield_sites.csv",
+                        colClasses = c("Brownfield_ID" = "character"))
+
+```
+
+# Step 2: Clean and standardize IDs
+```{r}
+# Public schools
+public_school_clean <- public_school %>%
+  mutate(
+    SCHOOL_ID = trimws(School_ID),
+    school_type = "Public"
+  )
+
+# Private schools
+private_school_clean <- private_school %>%
+  mutate(
+    SCHOOL_ID = trimws(PPIN),
+    school_type = "Private"
+  )
+
+# TRI
+tri_clean <- tri %>%
+  mutate(SITE_ID = trimws(X2..TRIFD)) %>%
+  rename(LONGITUDE = X13..LONGITUDE, LATITUDE = X12..LATITUDE)
+
+# Superfund
+superfund_clean <- superfund %>%
+  mutate(SITE_ID = trimws(EPA.ID)) %>%
+  rename(LONGITUDE = LONGITUDE, LATITUDE = LATITUDE)
+
+# Brownfields
+brownfield_clean <- brownfield %>%
+  mutate(SITE_ID = trimws(Brownfield_ID)) %>%
+  rename(LONGITUDE = Longitude, LATITUDE = Latitude)
+
+```
+
+# Step 3: Duplicate checks
+```{r}
+check_duplicates <- function(df, id_col, label) {
+  total_sites <- nrow(df)
+  unique_sites <- n_distinct(df[[id_col]])
+  
+  cat("\n---", label, "---\n")
+  cat("Total rows:", total_sites, "\n")
+  cat("Unique IDs:", unique_sites, "\n")
+  
+  if(total_sites == unique_sites) {
+    cat("All", label, "sites are unique.\n")
+  } else {
+    cat("There are duplicates in the", label, "dataset.\n")
+    df <- df %>% distinct(.data[[id_col]], .keep_all = TRUE)
+  }
+  return(df)
+}
+
+public_school_clean <- check_duplicates(public_school_clean, "SCHOOL_ID", "Public School")
+private_school_clean <- check_duplicates(private_school_clean, "SCHOOL_ID", "Private School")
+
+tri_clean <- check_duplicates(tri_clean, "SITE_ID", "TRI")
+superfund_clean <- check_duplicates(superfund_clean, "SITE_ID", "Superfund")
+brownfield_clean <- check_duplicates(brownfield_clean, "SITE_ID", "Brownfield")
+
+```
+
+# Step 4: Convert to sf objects
+```{r}
+# --- 1. Keep raw copies of original datasets ---
+tri_raw        <- tri_clean
+superfund_raw  <- superfund_clean
+brownfield_raw <- brownfield_clean
+
+# --- 2. Function: Convert to sf and remove empty geometries ---
+to_sf_clean <- function(df, lon_col = "LONGITUDE", lat_col = "LATITUDE") {
+  df %>%
+    filter(!is.na(.data[[lon_col]]) & !is.na(.data[[lat_col]])) %>%
+    st_as_sf(coords = c(lon_col, lat_col), crs = 4326) %>%
+    st_transform("ESRI:102010") %>%
+    filter(!st_is_empty(.))
+}
+
+# --- 3. Function: Check duplicates by coordinates ---
+check_dups <- function(sf_obj, name) {
+  dup_summary <- sf_obj %>%
+    st_coordinates() %>%
+    as_tibble() %>%
+    group_by(X, Y) %>%
+    summarise(n_sites = n(), .groups = "drop") %>%
+    filter(n_sites > 1)
+  
+  cat("=== ", name, " ===\n", sep = "")
+  cat("Unique coord pairs duplicated: ", nrow(dup_summary), "\n", sep = "")
+  cat("Total sites on duplicate coords: ", sum(dup_summary$n_sites), "\n", sep = "")
+  cat("Rows removable (if deduping): ", sum(dup_summary$n_sites - 1), "\n\n", sep = "")
+}
+
+# --- 4. Function: Deduplicate by coordinates ---
+dedup_sf <- function(sf_obj) {
+  # Safety: only POINT geometries
+  stopifnot(all(st_geometry_type(sf_obj) %in% c("POINT")))
+
+  # Deduplicate based on coordinates, rounded to specified digits
+  sf_obj %>%
+    group_by(
+      lon = round(st_coordinates(.)[,1], 5),
+      lat = round(st_coordinates(.)[,2], 5)
+    ) %>%
+    slice(1) %>%
+    ungroup()
+}
+
+# --- 5. Convert each dataset to sf ---
+tri_sf        <- to_sf_clean(tri_raw)
+superfund_sf  <- to_sf_clean(superfund_raw)
+brownfield_sf <- to_sf_clean(brownfield_raw)
+
+# Public schools
+public_school_sf <- to_sf_clean(public_school_clean, lon_col = "Longitude", lat_col = "Latitude")
+
+# Private schools
+private_school_sf <- to_sf_clean(private_school_clean, lon_col = "LON", lat_col = "LAT")
+
+# Combine
+all_school_sf <- bind_rows(
+  public_school_sf %>% mutate(school_type = "Public"),
+  private_school_sf %>% mutate(school_type = "Private")
+)
+
+# --- 6. Store raw counts ---
+counts_raw <- tibble(
+  Dataset = c("TRI", "Superfund", "Brownfield"),
+  Raw     = c(nrow(tri_raw), nrow(superfund_raw), nrow(brownfield_raw))
+)
+
+# --- 7. Store before counts (after removing empty geometries) ---
+counts_before <- tibble(
+  Dataset = c("TRI", "Superfund", "Brownfield"),
+  Before  = c(nrow(tri_sf), nrow(superfund_sf), nrow(brownfield_sf))
+)
+
+# --- 8. Check duplicates & deduplicate individually ---
+check_dups(tri_sf, "TRI")
+tri_sf <- dedup_sf(tri_sf)
+
+check_dups(superfund_sf, "Superfund")
+superfund_sf <- dedup_sf(superfund_sf)
+
+check_dups(brownfield_sf, "Brownfield")
+brownfield_sf <- dedup_sf(brownfield_sf)
+
+# --- 9. Store after counts (post-deduplication) ---
+counts_after <- tibble(
+  Dataset = c("TRI", "Superfund", "Brownfield"),
+  After   = c(nrow(tri_sf), nrow(superfund_sf), nrow(brownfield_sf))
+)
+
+# --- 10. Combine pollution datasets ---
+all_pollution_sf_before <- bind_rows(
+  tri_sf %>% mutate(site_type = "TRI"),
+  superfund_sf %>% mutate(site_type = "Superfund"),
+  brownfield_sf %>% mutate(site_type = "Brownfield")
+)
+combined_before_count <- nrow(all_pollution_sf_before)
+
+# --- 11. Check duplicates in combined dataset ---
+check_dups(all_pollution_sf_before, "Combined (before dedup)")
+
+# --- 12. Deduplicate combined dataset ---
+all_pollution_sf <- dedup_sf(all_pollution_sf_before)
+combined_after_count <- nrow(all_pollution_sf)
+
+# --- 13. Confirm final datasets are clean ---
+check_dups(tri_sf, "Final TRI")
+check_dups(superfund_sf, "Final Superfund")
+check_dups(brownfield_sf, "Final Brownfield")
+check_dups(all_pollution_sf, "Final Combined")
+
+# --- 14. Summary table with raw, before, after, removed counts ---
+summary_table <- tibble(
+  Dataset  = c("TRI", "Superfund", "Brownfield", "Combined"),
+  Raw      = c(counts_raw$Raw, NA),
+  Before   = c(counts_before$Before, combined_before_count),
+  After    = c(counts_after$After, combined_after_count),
+  Removed  = c(counts_before$Before - counts_after$After,
+               combined_before_count - combined_after_count)
+)
+
+summary_table
+
+```
+
+# Step 5: Define function to generate school-site pairs
+```{r}
+distances_mi <- c(0.125, 0.25, 0.50, 1)  
+distance_names <- c("0.125mi", "0.25mi", "0.5mi", "1mi")
+
+generate_pairs <- function(schools_sf, sites_sf, site_type, distances_mi, distance_names) {
+  school_id_col <- "SCHOOL_ID"
+  
+  distances_m <- distances_mi * 1609.34
+  all_pairs <- list()
+  
+  for (j in seq_along(distances_m)) {
+    buffer <- st_buffer(sites_sf, distances_m[j])
+    intersections <- st_intersects(schools_sf, buffer)
+    
+    temp <- tibble(
+      SCHOOL_ID = schools_sf[[school_id_col]],
+      site_ids = intersections
+    ) %>%
+      filter(lengths(site_ids) > 0) %>%
+      unnest(cols = site_ids) %>%
+      mutate(
+        SITE_ID = sites_sf$SITE_ID[site_ids],
+        buffer_distance = distance_names[j],
+        site_type = site_type
+      ) %>%
+      select(SCHOOL_ID, SITE_ID, buffer_distance, site_type)
+    
+    all_pairs[[j]] <- temp
+  }
+  
+  bind_rows(all_pairs)
+}
+
+```
+
+# Step 6: Generate school-site pairs
+```{r}
+# --- All Schools ---
+all_school_tri_pairs <- generate_pairs(all_school_sf, tri_sf,
+                                       "TRI", distances_mi, distance_names)
+
+all_school_superfund_pairs <- generate_pairs(all_school_sf, superfund_sf,
+                                             "Superfund", distances_mi, distance_names)
+
+all_school_brownfield_pairs <- generate_pairs(all_school_sf, brownfield_sf,
+                                              "Brownfield", distances_mi, distance_names)
+
+all_school_all_pairs <- generate_pairs(all_school_sf, all_pollution_sf,
+                                       "All Pollution Sites", distances_mi, distance_names)
+
+# --- Public schools ---
+public_school_tri_pairs <- generate_pairs(public_school_sf, tri_sf,
+                                          "TRI", distances_mi, distance_names)
+
+public_school_superfund_pairs <- generate_pairs(public_school_sf, superfund_sf, 
+                                                "Superfund", distances_mi, distance_names)
+
+public_school_brownfield_pairs <- generate_pairs(public_school_sf, brownfield_sf, 
+                                                 "Brownfield", distances_mi, distance_names)
+
+public_school_all_pairs <- generate_pairs(public_school_sf, all_pollution_sf,
+                                          "All Pollution Sites", distances_mi, distance_names)
+
+# --- Private schools ---
+private_school_tri_pairs <- generate_pairs(private_school_sf, tri_sf, 
+                                           "TRI", distances_mi, distance_names)
+
+private_school_superfund_pairs <- generate_pairs(private_school_sf, superfund_sf,
+                                                 "Superfund", distances_mi, distance_names)
+
+private_school_brownfield_pairs <- generate_pairs(private_school_sf, brownfield_sf,
+                                                  "Brownfield", distances_mi, distance_names)
+
+private_school_all_pairs <- generate_pairs(private_school_sf, all_pollution_sf,
+                                           "All Pollution Sites", distances_mi, distance_names)
+
+```
+
+# Step 7: Summarize results
+```{r}
+summarize_pairs <- function(pairs_df, schools_sf) {
+  with_state <- pairs_df %>%
+    left_join(
+      st_drop_geometry(schools_sf) %>% select(SCHOOL_ID, STATE, school_type),
+      by = "SCHOOL_ID"
+    )
+
+  national <- pairs_df %>%
+    group_by(buffer_distance) %>%
+    summarise(
+      unique_schools = n_distinct(SCHOOL_ID),
+      total_intersections = n(),
+      .groups = "drop"
+    )
+
+  state <- with_state %>%
+    group_by(STATE, buffer_distance) %>%
+    summarise(
+      unique_schools = n_distinct(SCHOOL_ID),
+      total_intersections = n(),
+      .groups = "drop"
+    )
+
+  return(list(national = national, state = state))
+}
+
+# --- All Schools ---
+tri_all_summary        <- summarize_pairs(all_school_tri_pairs, all_school_sf)
+superfund_all_summary  <- summarize_pairs(all_school_superfund_pairs, all_school_sf)
+brownfield_all_summary <- summarize_pairs(all_school_brownfield_pairs, all_school_sf)
+all_all_summary        <- summarize_pairs(all_school_all_pairs, all_school_sf)
+
+# --- Public schools ---
+tri_public_summary        <- summarize_pairs(public_school_tri_pairs, public_school_sf)
+superfund_public_summary  <- summarize_pairs(public_school_superfund_pairs, public_school_sf)
+brownfield_public_summary <- summarize_pairs(public_school_brownfield_pairs, public_school_sf)
+all_public_summary        <- summarize_pairs(public_school_all_pairs, public_school_sf)
+
+# --- Private schools ---
+tri_private_summary        <- summarize_pairs(private_school_tri_pairs, private_school_sf)
+superfund_private_summary  <- summarize_pairs(private_school_superfund_pairs, private_school_sf)
+brownfield_private_summary <- summarize_pairs(private_school_brownfield_pairs, private_school_sf)
+all_private_summary        <- summarize_pairs(private_school_all_pairs, private_school_sf)
+
+```
+
+# Step 8: Combine results
+```{r}
+# Count total schools
+n_all     <- nrow(all_school_sf)  
+n_public  <- nrow(public_school_sf)
+n_private <- nrow(private_school_sf)
+
+# --- All schools ---
+combined_national_all <- bind_rows(
+  tri_all_summary$national %>% mutate(source = "TRI"),
+  superfund_all_summary$national %>% mutate(source = "Superfund"),
+  brownfield_all_summary$national %>% mutate(source = "Brownfield"),
+  all_all_summary$national %>% mutate(source = "All Pollution Sites")
+) %>%
+  select(source, buffer_distance, unique_schools, total_intersections) %>%
+  mutate(prop_unique = round(unique_schools / n_all, 2))
+
+print(combined_national_all)
+
+# --- Public schools ---
+combined_national_public <- bind_rows(
+  tri_public_summary$national %>% mutate(source = "TRI"),
+  superfund_public_summary$national %>% mutate(source = "Superfund"),
+  brownfield_public_summary$national %>% mutate(source = "Brownfield"),
+  all_public_summary$national %>% mutate(source = "All Pollution Sites")
+) %>%
+  select(source, buffer_distance, unique_schools, total_intersections) %>%
+  mutate(prop_unique = round(unique_schools / n_public, 2))
+
+print(combined_national_public)
+
+# --- Private schools ---
+combined_national_private <- bind_rows(
+  tri_private_summary$national %>% mutate(source = "TRI"),
+  superfund_private_summary$national %>% mutate(source = "Superfund"),
+  brownfield_private_summary$national %>% mutate(source = "Brownfield"),
+  all_private_summary$national %>% mutate(source = "All Pollution Sites")
+) %>%
+  select(source, buffer_distance, unique_schools, total_intersections) %>%
+  mutate(prop_unique = round(unique_schools / n_private, 2))
+
+print(combined_national_private)
+
+```
+
+# Step 9: Merge site-pairs with public and private school characteristics
+```{r}
+# -------------------------------
+# Public Schools + Site Pairs
+# -------------------------------
+
+# Select school variables for merging
+public_school_vars <- c("SCHOOL_ID", "urbanicity", 
+                        "Total_Students_Public_2023_24", 
+                        "FRL_Students_Public_2023_24", 
+                        "Black_Students_Public_2023_24", 
+                        "Hispanic_Students_Public_2023_24", 
+                        "Native_Students_Public_2023_24",
+                        "Hawaiian_Students_Public_2023_24",
+                        "Asian_Students_Public_2023_24",
+                        "White_Students_Public_2023_24", 
+                        "prop_frl", "prop_black", "prop_hispanic", 
+                        "prop_native", "prop_hawaiian", "prop_asian", "prop_white",
+                        "SCH_ENR_IDEA_TOTAL", "SCH_ENR_EL_TOTAL", 
+                        "FTE_Teachers_Public_2023_24", "SCH_FTETEACH_TOT", 
+                        "SCH_FTECOUNSELORS", "SCH_FTESERVICES_NUR","SCH_FTESERVICES_PSY", "SCH_FTESERVICES_SOC", 
+                        "SCH_FTESECURITY_LEO", "SCH_FTESECURITY_GUA")
+
+# Merge TRI pairs with school characteristics
+tri_full_public <- public_school_tri_pairs %>%
+  left_join(public_school_clean %>% select(all_of(public_school_vars)), by = c("SCHOOL_ID" = "SCHOOL_ID")) %>%
+  mutate(site_type = "TRI")
+
+# Merge Superfund pairs
+superfund_full_public <- public_school_superfund_pairs %>%
+  left_join(public_school_clean %>% select(all_of(public_school_vars)), by = c("SCHOOL_ID" = "SCHOOL_ID")) %>%
+  mutate(site_type = "Superfund")
+
+# Merge Brownfield pairs
+brownfield_full_public <- public_school_brownfield_pairs %>%
+  left_join(public_school_clean %>% select(all_of(public_school_vars)), by = c("SCHOOL_ID" = "SCHOOL_ID")) %>%
+  mutate(site_type = "Brownfield")
+
+# Merge All Pollution Site pairs
+all_full_public <- public_school_all_pairs %>%
+  left_join(public_school_clean %>% select(all_of(public_school_vars)), by = c("SCHOOL_ID" = "SCHOOL_ID")) %>%
+  mutate(site_type = "All Pollution Sites")
+
+# Combine all site types including All Pollution Sites
+all_sites_full_public <- bind_rows(
+  tri_full_public,
+  superfund_full_public,
+  brownfield_full_public,
+  all_full_public    
+)
+
+# -------------------------------
+# Private Schools + Site Pairs
+# -------------------------------
+
+# Select school variables for merging
+private_school_vars <- c(
+  "SCHOOL_ID", 
+  "urbanicity", 
+  "Total_Students_Private_2019_20", 
+  "Black_Students_Private_2019_20", 
+  "Hispanic_Students_Private_2019_20", 
+  "Native_Students_Private_2019_20",
+  "Hawaiian_Students_Private_2019_20",
+  "Asian_Students_Private_2019_20",
+  "White_Students_Private_2019_20", 
+  "prop_black", "prop_hispanic", "prop_native", 
+  "prop_hawaiian", "prop_asian", "prop_white", 
+  "FTE_Teachers_Private_2019_20"
+)
+
+# TRI
+tri_full_private <- private_school_tri_pairs %>%
+  left_join(private_school_clean %>% select(all_of(private_school_vars)), by = "SCHOOL_ID") %>%
+  mutate(site_type = "TRI")
+
+# Superfund
+superfund_full_private <- private_school_superfund_pairs %>%
+  left_join(private_school_clean %>% select(all_of(private_school_vars)), by = "SCHOOL_ID") %>%
+  mutate(site_type = "Superfund")
+
+# Brownfield
+brownfield_full_private <- private_school_brownfield_pairs %>%
+  left_join(private_school_clean %>% select(all_of(private_school_vars)), by = "SCHOOL_ID") %>%
+  mutate(site_type = "Brownfield")
+
+# All Pollution Sites
+all_full_private <- private_school_all_pairs %>%
+  left_join(private_school_clean %>% select(all_of(private_school_vars)), by = "SCHOOL_ID") %>%
+  mutate(site_type = "All Pollution Sites")
+
+# Combine all site types including All Pollution Sites
+all_sites_full_private <- bind_rows(
+  tri_full_private,
+  superfund_full_private,
+  brownfield_full_private,
+  all_full_private
+)
+ 
+```
+
+# Step 10: Summarize public and private school characteristics
+```{r}
+# -----------------------------
+# Define column order
+# -----------------------------
+column_order <- c(
+  "school_type", "site_type", "buffer_distance",
+  "n_schools", "total_intersections",
+  "total_enrollment",
+  "total_FRL", "total_NonFRL",
+  "total_Black", "total_Hispanic", "total_Native",
+  "total_Hawaiian", "total_Asian", "total_White",
+  "total_IDEA", "total_NonIDEA",
+  "total_EL", "total_NonEL",
+  "total_teachers", "total_noninstr_staff", "total_staff",
+  "prob_FRL", "prob_NonFRL",
+  "prob_Black", "prob_Hispanic", "prob_Native",
+  "prob_Hawaiian", "prob_Asian", "prob_White",
+  "prob_IDEA", "prob_NonIDEA",
+  "prob_EL", "prob_NonEL"
+)
+
+exposure_order <- c(column_order, "Distance", "Comparison", "Prob_Ratio")
+
+# =============================
+# Deduplicate datasets
+# =============================
+all_sites_nodup_public <- all_sites_full_public %>%
+  distinct(SCHOOL_ID, site_type, buffer_distance, .keep_all = TRUE)
+
+intersection_counts <- all_sites_full_public %>%
+  count(site_type, buffer_distance, name = "total_intersections")
+
+all_sites_nodup_private <- all_sites_full_private %>%
+  distinct(SCHOOL_ID, site_type, buffer_distance, .keep_all = TRUE)
+
+intersection_counts_private <- all_sites_full_private %>%
+  count(site_type, buffer_distance, name = "total_intersections")
+
+# =============================
+# Factor levels for ordering
+# =============================
+site_type_levels <- c("Baseline", "All Pollution Sites", "Brownfield", "Superfund", "TRI")
+buffer_levels   <- c("All Schools", "0.125mi", "0.25mi", "0.5mi", "1mi")
+
+# =============================
+# Public Schools
+# =============================
+baseline_public <- public_school_clean %>%
+  summarise(
+    n_schools            = n(),
+    total_teachers       = round(sum(FTE_Teachers_Public_2023_24, na.rm = TRUE)),
+    total_noninstr_staff = round(sum(SCH_FTESERVICES_NUR + SCH_FTESERVICES_PSY +
+                                     SCH_FTESERVICES_SOC + SCH_FTESECURITY_LEO +
+                                     SCH_FTESECURITY_GUA, na.rm = TRUE)),
+    total_enrollment     = sum(Total_Students_Public_2023_24, na.rm = TRUE),
+    total_FRL            = sum(FRL_Students_Public_2023_24, na.rm = TRUE),
+    total_Black          = sum(Black_Students_Public_2023_24, na.rm = TRUE),
+    total_Hispanic       = sum(Hispanic_Students_Public_2023_24, na.rm = TRUE),
+    total_Native         = sum(Native_Students_Public_2023_24, na.rm = TRUE),
+    total_Hawaiian       = sum(Hawaiian_Students_Public_2023_24, na.rm = TRUE),
+    total_Asian          = sum(Asian_Students_Public_2023_24, na.rm = TRUE),
+    total_White          = sum(White_Students_Public_2023_24, na.rm = TRUE),
+    total_IDEA           = sum(SCH_ENR_IDEA_TOTAL, na.rm = TRUE),
+    total_EL             = sum(SCH_ENR_EL_TOTAL, na.rm = TRUE)
+  ) %>%
+  mutate(
+    site_type           = "Baseline",
+    buffer_distance     = "All Schools",
+    total_intersections = NA,
+    total_staff         = total_teachers + total_noninstr_staff,
+    school_type         = "Public"
+  ) %>%
+  select(any_of(column_order))
+
+sites_public <- all_sites_nodup_public %>%
+  group_by(site_type, buffer_distance) %>%
+  summarise(
+    n_schools            = n(),
+    total_teachers       = round(sum(FTE_Teachers_Public_2023_24, na.rm = TRUE)),
+    total_noninstr_staff = round(sum(SCH_FTESERVICES_NUR + SCH_FTESERVICES_PSY +
+                                     SCH_FTESERVICES_SOC + SCH_FTESECURITY_LEO +
+                                     SCH_FTESECURITY_GUA, na.rm = TRUE)),
+    total_enrollment     = sum(Total_Students_Public_2023_24, na.rm = TRUE),
+    total_FRL            = sum(FRL_Students_Public_2023_24, na.rm = TRUE),
+    total_Black          = sum(Black_Students_Public_2023_24, na.rm = TRUE),
+    total_Hispanic       = sum(Hispanic_Students_Public_2023_24, na.rm = TRUE),
+    total_Native         = sum(Native_Students_Public_2023_24, na.rm = TRUE),
+    total_Hawaiian       = sum(Hawaiian_Students_Public_2023_24, na.rm = TRUE),
+    total_Asian          = sum(Asian_Students_Public_2023_24, na.rm = TRUE),
+    total_White          = sum(White_Students_Public_2023_24, na.rm = TRUE),
+    total_IDEA           = sum(SCH_ENR_IDEA_TOTAL, na.rm = TRUE),
+    total_EL             = sum(SCH_ENR_EL_TOTAL, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(intersection_counts, by = c("site_type", "buffer_distance")) %>%
+  mutate(
+    total_staff = total_teachers + total_noninstr_staff,
+    school_type = "Public"
+  ) %>%
+  select(any_of(column_order))
+
+combined_public <- bind_rows(baseline_public, sites_public) %>%
+  mutate(
+    # Complement groups
+    total_NonFRL  = total_enrollment - total_FRL,
+    total_NonIDEA = total_enrollment - total_IDEA,
+    total_NonEL   = total_enrollment - total_EL,
+
+    # Baseline-normalized probabilities
+    prob_FRL      = round(total_FRL / total_FRL[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_NonFRL   = round(total_NonFRL / total_NonFRL[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+
+    prob_Black    = round(total_Black / total_Black[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Hispanic = round(total_Hispanic / total_Hispanic[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Native   = round(total_Native / total_Native[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Hawaiian = round(total_Hawaiian / total_Hawaiian[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Asian    = round(total_Asian / total_Asian[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_White    = round(total_White / total_White[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+
+    prob_IDEA     = round(total_IDEA / total_IDEA[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_NonIDEA  = round(total_NonIDEA / total_NonIDEA[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+
+    prob_EL       = round(total_EL / total_EL[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_NonEL    = round(total_NonEL / total_NonEL[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+
+    site_type       = factor(site_type, levels = site_type_levels),
+    buffer_distance = factor(buffer_distance, levels = buffer_levels)
+  ) %>%
+  arrange(site_type, buffer_distance) %>%
+  select(any_of(column_order))
+
+# =============================
+# Private Schools
+# =============================
+baseline_private <- private_school_clean %>%
+  summarise(
+    n_schools            = n(),
+    total_teachers       = round(sum(FTE_Teachers_Private_2019_20, na.rm = TRUE)),
+    total_noninstr_staff = NA,
+    total_enrollment     = sum(Total_Students_Private_2019_20, na.rm = TRUE),
+    total_FRL            = NA,
+    total_NonFRL         = NA,
+    total_Black          = sum(Black_Students_Private_2019_20, na.rm = TRUE),
+    total_Hispanic       = sum(Hispanic_Students_Private_2019_20, na.rm = TRUE),
+    total_Native         = sum(Native_Students_Private_2019_20, na.rm = TRUE),
+    total_Hawaiian       = sum(Hawaiian_Students_Private_2019_20, na.rm = TRUE),
+    total_Asian          = sum(Asian_Students_Private_2019_20, na.rm = TRUE),
+    total_White          = sum(White_Students_Private_2019_20, na.rm = TRUE),
+    total_IDEA           = NA,
+    total_NonIDEA        = NA,
+    total_EL             = NA,
+    total_NonEL          = NA
+  ) %>%
+  mutate(
+    site_type           = "Baseline",
+    buffer_distance     = "All Schools",
+    total_intersections = NA,
+    total_staff         = total_teachers,
+    school_type         = "Private"
+  ) %>%
+  select(any_of(column_order))
+
+sites_private <- all_sites_nodup_private %>%
+  group_by(site_type, buffer_distance) %>%
+  summarise(
+    n_schools            = n(),
+    total_teachers       = round(sum(FTE_Teachers_Private_2019_20, na.rm = TRUE)),
+    total_noninstr_staff = NA,
+    total_enrollment     = sum(Total_Students_Private_2019_20, na.rm = TRUE),
+    total_FRL            = NA,
+    total_NonFRL         = NA,
+    total_Black          = sum(Black_Students_Private_2019_20, na.rm = TRUE),
+    total_Hispanic       = sum(Hispanic_Students_Private_2019_20, na.rm = TRUE),
+    total_Native         = sum(Native_Students_Private_2019_20, na.rm = TRUE),
+    total_Hawaiian       = sum(Hawaiian_Students_Private_2019_20, na.rm = TRUE),
+    total_Asian          = sum(Asian_Students_Private_2019_20, na.rm = TRUE),
+    total_White          = sum(White_Students_Private_2019_20, na.rm = TRUE),
+    total_IDEA           = NA,
+    total_NonIDEA        = NA,
+    total_EL             = NA,
+    total_NonEL          = NA,
+    .groups = "drop"
+  ) %>%
+  left_join(intersection_counts_private, by = c("site_type", "buffer_distance")) %>%
+  mutate(
+    total_staff = total_teachers,
+    school_type = "Private"
+  ) %>%
+  select(any_of(column_order))
+
+combined_private <- bind_rows(baseline_private, sites_private) %>%
+  mutate(
+    prob_FRL      = NA,
+    prob_NonFRL   = NA,
+    prob_Black    = round(total_Black / total_Black[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Hispanic = round(total_Hispanic / total_Hispanic[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Native   = round(total_Native / total_Native[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Hawaiian = round(total_Hawaiian / total_Hawaiian[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Asian    = round(total_Asian / total_Asian[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_White    = round(total_White / total_White[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_IDEA     = NA,
+    prob_NonIDEA  = NA,
+    prob_EL       = NA,
+    prob_NonEL    = NA,
+    site_type       = factor(site_type, levels = site_type_levels),
+    buffer_distance = factor(buffer_distance, levels = buffer_levels)
+  ) %>%
+  arrange(site_type, buffer_distance) %>%
+  select(any_of(column_order))
+
+# =============================
+# Combined Public + Private
+# =============================
+combined_all <- bind_rows(combined_public, combined_private) %>%
+  group_by(site_type, buffer_distance) %>%
+  summarise(
+    n_schools            = sum(n_schools, na.rm = TRUE),
+    total_intersections  = sum(total_intersections, na.rm = TRUE),
+    total_teachers       = sum(total_teachers, na.rm = TRUE),
+    total_noninstr_staff = sum(total_noninstr_staff, na.rm = TRUE),
+    total_enrollment     = sum(total_enrollment, na.rm = TRUE),
+    total_FRL            = NA,
+    total_NonFRL         = NA,
+    total_Black          = sum(total_Black, na.rm = TRUE),
+    total_Hispanic       = sum(total_Hispanic, na.rm = TRUE),
+    total_Native         = sum(total_Native, na.rm = TRUE), 
+    total_Hawaiian       = sum(total_Hawaiian, na.rm = TRUE),
+    total_Asian          = sum(total_Asian, na.rm = TRUE),
+    total_White          = sum(total_White, na.rm = TRUE),
+    total_IDEA           = NA,
+    total_NonIDEA        = NA,
+    total_EL             = NA,
+    total_NonEL          = NA, 
+    total_staff          = sum(total_staff, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    prob_FRL      = NA,
+    prob_NonFRL   = NA,
+    prob_Black    = round(total_Black / total_Black[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Hispanic = round(total_Hispanic / total_Hispanic[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Native   = round(total_Native / total_Native[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Hawaiian = round(total_Hawaiian / total_Hawaiian[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Asian    = round(total_Asian / total_Asian[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_White    = round(total_White / total_White[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_IDEA     = NA,
+    prob_NonIDEA  = NA,
+    prob_EL       = NA,
+    prob_NonEL    = NA,
+    school_type   = "All Schools (Public and Private)"
+  ) %>%
+  arrange(site_type, buffer_distance) %>%
+  select(any_of(column_order))
+
+# =============================
+# Exposure Ratios
+# =============================
+exposure_ratios <- bind_rows(combined_public, combined_private, combined_all) %>%
+  filter(site_type == "All Pollution Sites") %>%
+  mutate(
+    Distance = factor(buffer_distance, levels = c("0.125mi", "0.25mi", "0.5mi", "1mi")),
+
+    FRL_vs_NonFRL = ifelse(school_type == "Public",
+                           round(prob_FRL / prob_NonFRL, 2),
+                           NA),
+
+    Black_vs_White    = round(prob_Black / prob_White, 2),
+    Hispanic_vs_White = round(prob_Hispanic / prob_White, 2),
+    Native_vs_White   = round(prob_Native / prob_White, 2),
+    Hawaiian_vs_White = round(prob_Hawaiian / prob_White, 2),
+    Asian_vs_White    = round(prob_Asian / prob_White, 2),
+
+    IDEA_vs_NonIDEA   = ifelse(school_type == "Public",
+                               round(prob_IDEA / prob_NonIDEA, 2),
+                               NA),
+
+    EL_vs_NonEL       = ifelse(school_type == "Public",
+                               round(prob_EL / prob_NonEL, 2),
+                               NA)
+  ) %>%
+  select(any_of(column_order), Distance,
+         FRL_vs_NonFRL, Black_vs_White, Hispanic_vs_White, 
+         Native_vs_White, Hawaiian_vs_White, Asian_vs_White,
+         IDEA_vs_NonIDEA, EL_vs_NonEL) %>%
+  pivot_longer(
+    cols = c(FRL_vs_NonFRL, Black_vs_White, Hispanic_vs_White,
+             Native_vs_White, Hawaiian_vs_White, Asian_vs_White,
+             IDEA_vs_NonIDEA, EL_vs_NonEL),
+    names_to = "Comparison",
+    values_to = "Prob_Ratio"
+  ) %>%
+  arrange(school_type, Distance, Comparison) %>%
+  select(any_of(exposure_order))
+
+```
+
+# Step 11: Summarize urbanicity 
+```{r}
+# =============================
+# --- 1️⃣ Public Schools ---
+# =============================
+
+# Baseline totals per urbanicity
+baseline_locale_public <- public_school_clean %>%
+  filter(!is.na(urbanicity)) %>%
+  group_by(urbanicity) %>%
+  summarise(total_schools_baseline = n(), .groups = "drop") %>%
+  mutate(buffer_distance = "All Schools",
+         site_type = "Baseline",
+         total_intersections = NA,
+         school_type = "Public")
+
+# Unique intersections by buffer × urbanicity
+locale_summary_public <- all_sites_full_public %>%
+  filter(!is.na(urbanicity)) %>%
+  group_by(site_type, buffer_distance, urbanicity) %>%
+  summarise(
+    n_schools = n_distinct(SCHOOL_ID),
+    total_intersections = n(),
+    .groups = "drop"
+  )
+
+# Fill missing combinations
+all_combos_public <- expand_grid(
+  site_type = unique(locale_summary_public$site_type),
+  buffer_distance = c("0.125mi", "0.25mi", "0.5mi", "1mi"),
+  urbanicity = c("city", "suburban", "town", "rural")
+)
+
+locale_summary_full_public <- all_combos_public %>%
+  left_join(locale_summary_public, by = c("site_type", "buffer_distance", "urbanicity")) %>%
+  mutate(
+    n_schools = replace_na(n_schools, 0),
+    total_intersections = replace_na(total_intersections, 0)
+  )
+
+locale_combined_public <- bind_rows(
+  baseline_locale_public %>% rename(n_schools = total_schools_baseline),
+  locale_summary_full_public %>% mutate(school_type = "Public")
+) %>%
+  arrange(site_type, buffer_distance, urbanicity)
+
+# Compute proportions
+locale_processed_public <- locale_combined_public %>%
+  filter(site_type != "Baseline") %>%
+  left_join(
+    baseline_locale_public %>% select(urbanicity, total_schools_baseline),
+    by = "urbanicity"
+  ) %>%
+  mutate(prop_schools = n_schools / total_schools_baseline) %>%
+  select(school_type, site_type, buffer_distance, urbanicity,
+         n_schools, total_intersections, total_schools = total_schools_baseline, prop_schools)
+
+
+# =============================
+# --- 2️⃣ Private Schools ---
+# =============================
+
+baseline_locale_private <- private_school_clean %>%
+  filter(!is.na(urbanicity)) %>%
+  group_by(urbanicity) %>%
+  summarise(total_schools_baseline = n(), .groups = "drop") %>%
+  mutate(buffer_distance = "All Schools",
+         site_type = "Baseline",
+         total_intersections = NA,
+         school_type = "Private")
+
+locale_summary_private <- all_sites_full_private %>%
+  filter(!is.na(urbanicity)) %>%
+  group_by(site_type, buffer_distance, urbanicity) %>%
+  summarise(
+    n_schools = n_distinct(SCHOOL_ID),
+    total_intersections = n(),
+    .groups = "drop"
+  )
+
+all_combos_private <- expand_grid(
+  site_type = unique(locale_summary_private$site_type),
+  buffer_distance = c("0.125mi", "0.25mi", "0.5mi", "1mi"),
+  urbanicity = c("city", "suburban", "town", "rural")
+)
+
+locale_summary_full_private <- all_combos_private %>%
+  left_join(locale_summary_private, by = c("site_type", "buffer_distance", "urbanicity")) %>%
+  mutate(
+    n_schools = replace_na(n_schools, 0),
+    total_intersections = replace_na(total_intersections, 0)
+  )
+
+locale_combined_private <- bind_rows(
+  baseline_locale_private %>% rename(n_schools = total_schools_baseline),
+  locale_summary_full_private %>% mutate(school_type = "Private")
+) %>%
+  arrange(site_type, buffer_distance, urbanicity)
+
+locale_processed_private <- locale_combined_private %>%
+  filter(site_type != "Baseline") %>%
+  left_join(
+    baseline_locale_private %>% select(urbanicity, total_schools_baseline),
+    by = "urbanicity"
+  ) %>%
+  mutate(prop_schools = n_schools / total_schools_baseline) %>%
+  select(school_type, site_type, buffer_distance, urbanicity,
+         n_schools, total_intersections, total_schools = total_schools_baseline, prop_schools)
+
+
+# =============================
+# --- 3️⃣ Combined Public + Private ---
+# =============================
+
+# Combine public + private rows
+locale_combined_all <- bind_rows(
+  locale_combined_public %>% mutate(school_type = "Public"),
+  locale_combined_private %>% mutate(school_type = "Private")
+)
+
+# Bring in baseline totals for all urbanicities
+baseline_totals_all <- bind_rows(
+  baseline_locale_public %>% mutate(school_type = "Public"),
+  baseline_locale_private %>% mutate(school_type = "Private")
+) %>%
+  group_by(urbanicity) %>%
+  summarise(total_schools_baseline = sum(total_schools_baseline), .groups = "drop")
+
+# Summarise by site_type × buffer_distance × urbanicity
+locale_combined_all_summary <- locale_combined_all %>%
+  group_by(site_type, buffer_distance, urbanicity) %>%
+  summarise(
+    n_schools = sum(n_schools, na.rm = TRUE),
+    total_intersections = sum(total_intersections, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(school_type = "All Schools")
+
+# Add baseline totals to compute proportions
+locale_processed_all <- locale_combined_all_summary %>%
+  left_join(baseline_totals_all, by = "urbanicity") %>%
+  mutate(prop_schools = n_schools / total_schools_baseline) %>%
+  select(
+    school_type, site_type, buffer_distance, urbanicity,
+    n_schools, total_intersections, total_schools = total_schools_baseline, prop_schools
+  )
+
+```
+
+# Repeat Steps for Higher-Risk Sites
+```{r}
+# -------------------------------
+# High-Risk Pollution Sites: School-Level Summary (Consistent Logic)
+# -------------------------------
+
+# -------------------------------
+# 1. Superfund
+# -------------------------------
+superfund_highrisk_sf <- superfund_sf %>%
+  mutate(
+    HighRisk_flag = NPL %in% c("Currently on the Final NPL", "Site is Part of NPL Site")
+  ) %>%
+  select(SITE_ID, geometry, HighRisk_flag)
+
+school_level_superfund <- all_school_superfund_pairs %>%
+  left_join(superfund_highrisk_sf %>% st_drop_geometry() %>% select(SITE_ID, HighRisk_flag),
+            by = "SITE_ID") %>%
+  mutate(HighRisk_flag = ifelse(is.na(HighRisk_flag), FALSE, HighRisk_flag)) %>%
+  group_by(buffer_distance, SCHOOL_ID) %>%
+  summarise(any_highrisk = any(HighRisk_flag), .groups = "drop") %>%
+  group_by(buffer_distance, any_highrisk) %>%
+  summarise(n_schools = n(), .groups = "drop") %>%
+  mutate(
+    prop_schools = round(n_schools / n_all, 2),
+    interpretation = ifelse(any_highrisk,
+                            "Schools with ≥1 high-risk Superfund site nearby",
+                            "Schools with 0 high-risk Superfund sites nearby")
+  )
+
+# -------------------------------
+# 2. Brownfield
+# -------------------------------
+# NOTE: "Insuffient Inforamtion\n" is spelled incorrectly in the data
+brownfield_highrisk_sf <- brownfield_sf %>%
+  mutate(
+    # Trim whitespace/newlines
+    Contaminant_Clean = str_trim(Contaminants.Found.at.Actionable.Level),
+    
+    # Assign status
+    Contaminant_Status = case_when(
+      is.na(Contaminant_Clean) ~ "Missing",                        # NA → Missing
+      Contaminant_Clean == "" ~ "Empty",                           # Empty string → Empty
+      Contaminant_Clean == "No Contaminants\n" ~ "Empty",          # Exactly "No Contaminants\n" → Empty
+      Contaminant_Clean == "Insuffient Inforamtion\n" ~ "Missing", # Exactly "Insuffient Inforamtion\n" → Missing
+      Contaminant_Clean == "No Contaminants\nInsuffient Inforamtion\n" ~ "Missing", # Both → Missing
+      TRUE ~ "Has Contaminants"                                     # Everything else → Has Contaminants
+    ),
+    
+    # Cleanup flag
+    Cleanup_Required = toupper(Indicate.whether.Cleanup.is.Necessary) == "Y",
+    
+    # High risk flag
+    HighRisk_flag = Cleanup_Required & Contaminant_Status == "Has Contaminants"
+  ) %>%
+  select(SITE_ID, geometry, Contaminant_Status, Cleanup_Required, HighRisk_flag)
+
+school_level_brownfield <- all_school_brownfield_pairs %>%
+  left_join(brownfield_highrisk_sf %>% st_drop_geometry() %>% select(SITE_ID, HighRisk_flag),
+            by = "SITE_ID") %>%
+  mutate(HighRisk_flag = ifelse(is.na(HighRisk_flag), FALSE, HighRisk_flag)) %>%
+  group_by(buffer_distance, SCHOOL_ID) %>%
+  summarise(any_highrisk = any(HighRisk_flag), .groups = "drop") %>%
+  group_by(buffer_distance, any_highrisk) %>%
+  summarise(n_schools = n(), .groups = "drop") %>%
+  mutate(
+    prop_schools = round(n_schools / n_all, 2),
+    interpretation = ifelse(any_highrisk,
+                            "Schools with ≥1 high-risk Brownfield nearby",
+                            "Schools with 0 high-risk Brownfield sites nearby")
+  )
+
+# -------------------------------
+# 3. TRI
+# -------------------------------
+tri_highrisk_flag <- tri %>%
+  mutate(
+    total_releases_lbs = case_when(
+      `X50..UNIT.OF.MEASURE` == "Pounds" ~ `X107..TOTAL.RELEASES`,
+      `X50..UNIT.OF.MEASURE` == "Grams"  ~ `X107..TOTAL.RELEASES` * 0.00220462,
+      TRUE ~ NA_real_
+    ),
+    HighRisk_flag = total_releases_lbs >= 1000
+  ) %>%
+  group_by(SITE_ID = trimws(X2..TRIFD)) %>%
+  summarise(HighRisk_flag = any(HighRisk_flag, na.rm = TRUE), .groups = "drop")
+
+tri_highrisk_sf <- tri_sf %>%
+  left_join(tri_highrisk_flag, by = "SITE_ID") %>%
+  select(SITE_ID, geometry, HighRisk_flag)
+
+school_level_tri <- all_school_tri_pairs %>%
+  left_join(tri_highrisk_sf %>% st_drop_geometry() %>% select(SITE_ID, HighRisk_flag),
+            by = "SITE_ID") %>%
+  mutate(HighRisk_flag = ifelse(is.na(HighRisk_flag), FALSE, HighRisk_flag)) %>%
+  group_by(buffer_distance, SCHOOL_ID) %>%
+  summarise(any_highrisk = any(HighRisk_flag), .groups = "drop") %>%
+  group_by(buffer_distance, any_highrisk) %>%
+  summarise(n_schools = n(), .groups = "drop") %>%
+  mutate(
+    prop_schools = round(n_schools / n_all, 2),
+    interpretation = ifelse(any_highrisk,
+                            "Schools with ≥1 high-risk TRI site nearby",
+                            "Schools with 0 high-risk TRI sites nearby")
+  )
+
+# -------------------------------
+# 4. All high-risk sites combined
+# -------------------------------
+all_pollution_highrisk_sf <- dedup_sf(bind_rows(
+  superfund_highrisk_sf,
+  brownfield_highrisk_sf,
+  tri_highrisk_sf
+))
+
+school_level_all <- all_school_all_pairs %>%
+  left_join(all_pollution_highrisk_sf %>% st_drop_geometry() %>% select(SITE_ID, HighRisk_flag),
+            by = "SITE_ID") %>%
+  mutate(HighRisk_flag = ifelse(is.na(HighRisk_flag), FALSE, HighRisk_flag)) %>%
+  group_by(buffer_distance, SCHOOL_ID) %>%
+  summarise(any_highrisk = any(HighRisk_flag), .groups = "drop") %>%
+  group_by(buffer_distance, any_highrisk) %>%
+  summarise(n_schools = n(), .groups = "drop") %>%
+  mutate(
+    prop_schools = round(n_schools / n_all, 2),
+    interpretation = ifelse(any_highrisk,
+                            "Schools with ≥1 high-risk site nearby (any category)",
+                            "Schools with 0 high-risk sites nearby")
+  )
+
+# -------------------------------
+# 5. Print summaries
+# -------------------------------
+
+print(school_level_superfund)
+print(school_level_brownfield)
+print(school_level_tri)
+print(school_level_all)
+
+```
+
+```{r}
+# -------------------------------
+# 1. Superfund: add demographics
+# -------------------------------
+schools_near_hr_superfunds <- all_school_superfund_pairs %>%
+  left_join(superfund_highrisk_sf %>% st_drop_geometry() %>% select(SITE_ID, HighRisk_flag),
+            by = "SITE_ID") %>%
+  mutate(HighRisk_flag = ifelse(is.na(HighRisk_flag), FALSE, HighRisk_flag)) %>%
+  filter(HighRisk_flag == TRUE) %>%
+  distinct(SCHOOL_ID, SITE_ID, buffer_distance)
+
+schools_near_hr_superfunds_public <- schools_near_hr_superfunds %>%
+  inner_join(public_school_clean, by = "SCHOOL_ID")
+
+schools_near_hr_superfunds_private <- schools_near_hr_superfunds %>%
+  inner_join(private_school_clean, by = "SCHOOL_ID")
+
+schools_near_hr_superfunds_all <- bind_rows(
+  schools_near_hr_superfunds_public %>% mutate(school_type = "Public"),
+  schools_near_hr_superfunds_private %>% mutate(school_type = "Private")
+)
+
+# -------------------------------
+# 2. Brownfield: add demographics
+# -------------------------------
+schools_near_hr_brownfields <- all_school_brownfield_pairs %>%
+  left_join(brownfield_highrisk_sf %>% st_drop_geometry() %>% select(SITE_ID, HighRisk_flag),
+            by = "SITE_ID") %>%
+  mutate(HighRisk_flag = ifelse(is.na(HighRisk_flag), FALSE, HighRisk_flag)) %>%
+  filter(HighRisk_flag == TRUE) %>%
+  distinct(SCHOOL_ID, SITE_ID, buffer_distance)
+
+schools_near_hr_brownfields_public <- schools_near_hr_brownfields %>%
+  inner_join(public_school_clean, by = "SCHOOL_ID")
+
+schools_near_hr_brownfields_private <- schools_near_hr_brownfields %>%
+  inner_join(private_school_clean, by = "SCHOOL_ID")
+
+schools_near_hr_brownfields_all <- bind_rows(
+  schools_near_hr_brownfields_public %>% mutate(school_type = "Public"),
+  schools_near_hr_brownfields_private %>% mutate(school_type = "Private")
+)
+
+# -------------------------------
+# 3. TRI: add demographics
+# -------------------------------
+schools_near_hr_tri <- all_school_tri_pairs %>%
+  left_join(tri_highrisk_sf %>% st_drop_geometry() %>% select(SITE_ID, HighRisk_flag),
+            by = "SITE_ID") %>%
+  mutate(HighRisk_flag = ifelse(is.na(HighRisk_flag), FALSE, HighRisk_flag)) %>%
+  filter(HighRisk_flag == TRUE) %>%
+  distinct(SCHOOL_ID, SITE_ID, buffer_distance)
+
+schools_near_hr_tri_public <- schools_near_hr_tri %>%
+  inner_join(public_school_clean, by = "SCHOOL_ID")
+
+schools_near_hr_tri_private <- schools_near_hr_tri %>%
+  inner_join(private_school_clean, by = "SCHOOL_ID")
+
+schools_near_hr_tri_all <- bind_rows(
+  schools_near_hr_tri_public %>% mutate(school_type = "Public"),
+  schools_near_hr_tri_private %>% mutate(school_type = "Private")
+)
+
+# -------------------------------
+# 4. All high-risk sites combined
+# -------------------------------
+schools_near_hr_all <- all_school_all_pairs %>%
+  left_join(all_pollution_highrisk_sf %>% st_drop_geometry() %>% select(SITE_ID, HighRisk_flag),
+            by = "SITE_ID") %>%
+  mutate(HighRisk_flag = ifelse(is.na(HighRisk_flag), FALSE, HighRisk_flag)) %>%
+  filter(HighRisk_flag == TRUE) %>%
+  distinct(SCHOOL_ID, SITE_ID, buffer_distance)
+
+schools_near_hr_all_public <- schools_near_hr_all %>%
+  inner_join(public_school_clean, by = "SCHOOL_ID")
+
+schools_near_hr_all_private <- schools_near_hr_all %>%
+  inner_join(private_school_clean, by = "SCHOOL_ID")
+
+schools_near_hr_all_combined <- bind_rows(
+  schools_near_hr_all_public %>% mutate(school_type = "Public"),
+  schools_near_hr_all_private %>% mutate(school_type = "Private")
+)
+
+```
+
+```{r}
+# -----------------------------
+# Define column order
+# -----------------------------
+column_order_hr <- c(
+  "school_type", "site_type", "buffer_distance",
+  "n_schools", "total_intersections",
+  "total_enrollment",
+  "total_FRL", "total_NonFRL",
+  "total_Black", "total_Hispanic", "total_Native",
+  "total_Hawaiian", "total_Asian", "total_White",
+  "total_IDEA", "total_NonIDEA",
+  "total_EL", "total_NonEL",
+  "total_teachers", "total_noninstr_staff", "total_staff",
+  "prob_FRL", "prob_NonFRL",
+  "prob_Black", "prob_Hispanic", "prob_Native",
+  "prob_Hawaiian", "prob_Asian", "prob_White",
+  "prob_IDEA", "prob_NonIDEA",
+  "prob_EL", "prob_NonEL"
+)
+
+exposure_order_hr <- c(column_order_hr, "Distance", "Comparison", "Prob_Ratio")
+
+# -----------------------------
+# Combine all high-risk sites
+# -----------------------------
+all_sites_hr_public_combined <- bind_rows(
+  schools_near_hr_superfunds_all %>% filter(school_type=="Public") %>% mutate(site_type = "Superfund"),
+  schools_near_hr_brownfields_all %>% filter(school_type=="Public") %>% mutate(site_type = "Brownfield"),
+  schools_near_hr_tri_all %>% filter(school_type=="Public") %>% mutate(site_type = "TRI"),
+  schools_near_hr_all_combined %>% filter(school_type=="Public") %>% mutate(site_type = "All Pollution Sites")
+)
+
+all_sites_hr_private_combined <- bind_rows(
+  schools_near_hr_superfunds_all %>% filter(school_type=="Private") %>% mutate(site_type = "Superfund"),
+  schools_near_hr_brownfields_all %>% filter(school_type=="Private") %>% mutate(site_type = "Brownfield"),
+  schools_near_hr_tri_all %>% filter(school_type=="Private") %>% mutate(site_type = "TRI"),
+  schools_near_hr_all_combined %>% filter(school_type=="Private") %>% mutate(site_type = "All Pollution Sites")
+)
+
+# -----------------------------
+# Deduplicate datasets
+# -----------------------------
+hr_sites_nodup_public <- all_sites_hr_public_combined %>%
+  distinct(SCHOOL_ID, site_type, buffer_distance, .keep_all = TRUE)
+
+hr_intersection_counts_public <- all_sites_hr_public_combined %>%
+  count(site_type, buffer_distance, name = "total_intersections")
+
+hr_sites_nodup_private <- all_sites_hr_private_combined %>%
+  distinct(SCHOOL_ID, site_type, buffer_distance, .keep_all = TRUE)
+
+hr_intersection_counts_private <- all_sites_hr_private_combined %>%
+  count(site_type, buffer_distance, name = "total_intersections")
+
+# -----------------------------
+# Factor levels
+# -----------------------------
+site_type_levels_hr <- c("Baseline", "All Pollution Sites", "Brownfield", "Superfund", "TRI")
+buffer_levels_hr   <- c("All Schools", "0.125mi", "0.25mi", "0.5mi", "1mi")
+
+# -----------------------------
+# Public Schools
+# -----------------------------
+baseline_public_hr <- public_school_clean %>%
+  summarise(
+    n_schools            = n(),
+    total_teachers       = round(sum(FTE_Teachers_Public_2023_24, na.rm = TRUE)),
+    total_noninstr_staff = round(sum(SCH_FTESERVICES_NUR + SCH_FTESERVICES_PSY +
+                                     SCH_FTESERVICES_SOC + SCH_FTESECURITY_LEO +
+                                     SCH_FTESECURITY_GUA, na.rm = TRUE)),
+    total_enrollment     = sum(Total_Students_Public_2023_24, na.rm = TRUE),
+    total_FRL            = sum(FRL_Students_Public_2023_24, na.rm = TRUE),
+    total_Black          = sum(Black_Students_Public_2023_24, na.rm = TRUE),
+    total_Hispanic       = sum(Hispanic_Students_Public_2023_24, na.rm = TRUE),
+    total_Native         = sum(Native_Students_Public_2023_24, na.rm = TRUE),
+    total_Hawaiian       = sum(Hawaiian_Students_Public_2023_24, na.rm = TRUE),
+    total_Asian          = sum(Asian_Students_Public_2023_24, na.rm = TRUE),
+    total_White          = sum(White_Students_Public_2023_24, na.rm = TRUE),
+    total_IDEA           = sum(SCH_ENR_IDEA_TOTAL, na.rm = TRUE),
+    total_EL             = sum(SCH_ENR_EL_TOTAL, na.rm = TRUE)
+  ) %>%
+  mutate(
+    site_type           = "Baseline",
+    buffer_distance     = "All Schools",
+    total_intersections = NA,
+    total_staff         = total_teachers + total_noninstr_staff,
+    school_type         = "Public"
+  ) %>%
+  select(any_of(column_order_hr))
+
+sites_public_hr <- hr_sites_nodup_public %>%
+  group_by(site_type, buffer_distance) %>%
+  summarise(
+    n_schools            = n(),
+    total_teachers       = round(sum(FTE_Teachers_Public_2023_24, na.rm = TRUE)),
+    total_noninstr_staff = round(sum(SCH_FTESERVICES_NUR + SCH_FTESERVICES_PSY +
+                                     SCH_FTESERVICES_SOC + SCH_FTESECURITY_LEO +
+                                     SCH_FTESECURITY_GUA, na.rm = TRUE)),
+    total_enrollment     = sum(Total_Students_Public_2023_24, na.rm = TRUE),
+    total_FRL            = sum(FRL_Students_Public_2023_24, na.rm = TRUE),
+    total_Black          = sum(Black_Students_Public_2023_24, na.rm = TRUE),
+    total_Hispanic       = sum(Hispanic_Students_Public_2023_24, na.rm = TRUE),
+    total_Native         = sum(Native_Students_Public_2023_24, na.rm = TRUE),
+    total_Hawaiian       = sum(Hawaiian_Students_Public_2023_24, na.rm = TRUE),
+    total_Asian          = sum(Asian_Students_Public_2023_24, na.rm = TRUE),
+    total_White          = sum(White_Students_Public_2023_24, na.rm = TRUE),
+    total_IDEA           = sum(SCH_ENR_IDEA_TOTAL, na.rm = TRUE),
+    total_EL             = sum(SCH_ENR_EL_TOTAL, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  left_join(hr_intersection_counts_public, by = c("site_type", "buffer_distance")) %>%
+  mutate(
+    total_staff = total_teachers + total_noninstr_staff,
+    school_type = "Public"
+  ) %>%
+  select(any_of(column_order_hr))
+
+combined_public_hr <- bind_rows(baseline_public_hr, sites_public_hr) %>%
+  mutate(
+    # Complement groups
+    total_NonFRL  = total_enrollment - total_FRL,
+    total_NonIDEA = total_enrollment - total_IDEA,
+    total_NonEL   = total_enrollment - total_EL,
+
+    # Baseline-normalized probabilities
+    prob_FRL      = round(total_FRL / total_FRL[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_NonFRL   = round(total_NonFRL / total_NonFRL[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Black    = round(total_Black / total_Black[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Hispanic = round(total_Hispanic / total_Hispanic[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Native   = round(total_Native / total_Native[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Hawaiian = round(total_Hawaiian / total_Hawaiian[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Asian    = round(total_Asian / total_Asian[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_White    = round(total_White / total_White[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_IDEA     = round(total_IDEA / total_IDEA[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_NonIDEA  = round(total_NonIDEA / total_NonIDEA[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_EL       = round(total_EL   / total_EL[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_NonEL    = round(total_NonEL / total_NonEL[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+
+    site_type       = factor(site_type, levels = site_type_levels_hr),
+    buffer_distance = factor(buffer_distance, levels = buffer_levels_hr)
+  ) %>%
+  arrange(site_type, buffer_distance) %>%
+  select(any_of(column_order_hr))
+
+# -----------------------------
+# Private Schools
+# -----------------------------
+baseline_private_hr <- private_school_clean %>%
+  summarise(
+    n_schools            = n(),
+    total_teachers       = round(sum(FTE_Teachers_Private_2019_20, na.rm = TRUE)),
+    total_noninstr_staff = NA,
+    total_enrollment     = sum(Total_Students_Private_2019_20, na.rm = TRUE),
+    total_FRL            = NA,
+    total_NonFRL         = NA,
+    total_Black          = sum(Black_Students_Private_2019_20, na.rm = TRUE),
+    total_Hispanic       = sum(Hispanic_Students_Private_2019_20, na.rm = TRUE),
+    total_Native         = sum(Native_Students_Private_2019_20, na.rm = TRUE),
+    total_Hawaiian       = sum(Hawaiian_Students_Private_2019_20, na.rm = TRUE),
+    total_Asian          = sum(Asian_Students_Private_2019_20, na.rm = TRUE),
+    total_White          = sum(White_Students_Private_2019_20, na.rm = TRUE),
+    total_IDEA           = NA,
+    total_NonIDEA        = NA,
+    total_EL             = NA,
+    total_NonEL          = NA
+  ) %>%
+  mutate(
+    site_type           = "Baseline",
+    buffer_distance     = "All Schools",
+    total_intersections = NA,
+    total_staff         = total_teachers,
+    school_type         = "Private"
+  ) %>%
+  select(any_of(column_order_hr))
+
+sites_private_hr <- hr_sites_nodup_private %>%
+  group_by(site_type, buffer_distance) %>%
+  summarise(
+    n_schools            = n(),
+    total_teachers       = round(sum(FTE_Teachers_Private_2019_20, na.rm = TRUE)),
+    total_noninstr_staff = NA,
+    total_enrollment     = sum(Total_Students_Private_2019_20, na.rm = TRUE),
+    total_FRL            = NA,
+    total_NonFRL         = NA,
+    total_Black          = sum(Black_Students_Private_2019_20, na.rm = TRUE),
+    total_Hispanic       = sum(Hispanic_Students_Private_2019_20, na.rm = TRUE),
+    total_Native         = sum(Native_Students_Private_2019_20, na.rm = TRUE),
+    total_Hawaiian       = sum(Hawaiian_Students_Private_2019_20, na.rm = TRUE),
+    total_Asian          = sum(Asian_Students_Private_2019_20, na.rm = TRUE),
+    total_White          = sum(White_Students_Private_2019_20, na.rm = TRUE),
+    total_IDEA           = NA,
+    total_NonIDEA        = NA,
+    total_EL             = NA,
+    total_NonEL          = NA,
+    .groups = "drop"
+  ) %>%
+  left_join(hr_intersection_counts_private, by = c("site_type", "buffer_distance")) %>%
+  mutate(
+    total_staff = total_teachers,
+    school_type = "Private"
+  ) %>%
+  select(any_of(column_order_hr))
+
+combined_private_hr <- bind_rows(baseline_private_hr, sites_private_hr) %>%
+  mutate(
+    prob_FRL      = NA,
+    prob_NonFRL   = NA,
+    prob_Black    = round(total_Black / total_Black[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Hispanic = round(total_Hispanic / total_Hispanic[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Native   = round(total_Native / total_Native[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Hawaiian = round(total_Hawaiian / total_Hawaiian[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Asian    = round(total_Asian / total_Asian[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_White    = round(total_White / total_White[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_IDEA     = NA,
+    prob_NonIDEA  = NA,
+    prob_EL       = NA,
+    prob_NonEL    = NA,
+    site_type       = factor(site_type, levels = site_type_levels_hr),
+    buffer_distance = factor(buffer_distance, levels = buffer_levels_hr)
+  ) %>%
+  arrange(site_type, buffer_distance) %>%
+  select(any_of(column_order_hr))
+
+# -----------------------------
+# Combined Public + Private
+# -----------------------------
+combined_all_hr <- bind_rows(combined_public_hr, combined_private_hr) %>%
+  group_by(site_type, buffer_distance) %>%
+  summarise(
+    n_schools            = sum(n_schools, na.rm = TRUE),
+    total_intersections  = sum(total_intersections, na.rm = TRUE),
+    total_teachers       = sum(total_teachers, na.rm = TRUE),
+    total_noninstr_staff = sum(total_noninstr_staff, na.rm = TRUE),
+    total_enrollment     = sum(total_enrollment, na.rm = TRUE),
+    total_FRL            = NA,
+    total_NonFRL         = NA,
+    total_Black          = sum(total_Black, na.rm = TRUE),
+    total_Hispanic       = sum(total_Hispanic, na.rm = TRUE),
+    total_Native         = sum(total_Native, na.rm = TRUE), 
+    total_Hawaiian       = sum(total_Hawaiian, na.rm = TRUE),
+    total_Asian          = sum(total_Asian, na.rm = TRUE),
+    total_White          = sum(total_White, na.rm = TRUE),
+    total_IDEA           = NA,
+    total_NonIDEA        = NA,
+    total_EL             = NA,
+    total_NonEL          = NA, 
+    total_staff          = sum(total_staff, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    prob_FRL      = NA,
+    prob_NonFRL   = NA,
+    prob_Black    = round(total_Black / total_Black[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Hispanic = round(total_Hispanic / total_Hispanic[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Native   = round(total_Native / total_Native[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Hawaiian = round(total_Hawaiian / total_Hawaiian[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_Asian    = round(total_Asian / total_Asian[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_White    = round(total_White / total_White[site_type=="Baseline" & buffer_distance=="All Schools"], 3),
+    prob_IDEA     = NA,
+    prob_NonIDEA  = NA,
+    prob_EL       = NA,
+    prob_NonEL    = NA,
+    school_type   = "All Schools (Public and Private)"
+  ) %>%
+  arrange(site_type, buffer_distance) %>%
+  select(any_of(column_order_hr))
+
+# -----------------------------
+# Exposure Ratios
+# -----------------------------
+exposure_ratios_hr <- bind_rows(combined_public_hr, combined_private_hr, combined_all_hr) %>%
+  filter(site_type == "All Pollution Sites") %>%
+  mutate(
+    Distance = factor(buffer_distance, levels = c("0.125mi", "0.25mi", "0.5mi", "1mi")),
+
+    FRL_vs_NonFRL = ifelse(school_type == "Public",
+                           round(prob_FRL / prob_NonFRL, 2),
+                           NA),
+
+    Black_vs_White    = round(prob_Black / prob_White, 2),
+    Hispanic_vs_White = round(prob_Hispanic / prob_White, 2),
+    Native_vs_White   = round(prob_Native / prob_White, 2),
+    Hawaiian_vs_White = round(prob_Hawaiian / prob_White, 2),
+    Asian_vs_White    = round(prob_Asian / prob_White, 2),
+
+    IDEA_vs_NonIDEA   = ifelse(school_type == "Public",
+                               round(prob_IDEA / prob_NonIDEA, 2),
+                               NA),
+
+    EL_vs_NonEL       = ifelse(school_type == "Public",
+                               round(prob_EL / prob_NonEL, 2),
+                               NA)
+  ) %>%
+  select(any_of(column_order_hr), Distance,
+         FRL_vs_NonFRL, Black_vs_White, Hispanic_vs_White, 
+         Native_vs_White, Hawaiian_vs_White, Asian_vs_White,
+         IDEA_vs_NonIDEA, EL_vs_NonEL) %>%
+  pivot_longer(
+    cols = c(FRL_vs_NonFRL, Black_vs_White, Hispanic_vs_White,
+             Native_vs_White, Hawaiian_vs_White, Asian_vs_White,
+             IDEA_vs_NonIDEA, EL_vs_NonEL),
+    names_to = "Comparison",
+    values_to = "Prob_Ratio"
+  ) %>%
+  arrange(school_type, Distance, Comparison) %>%
+  select(any_of(exposure_order_hr))
+
+# -----------------------------
+# Print outputs
+# -----------------------------
+
+combined_public_hr
+combined_private_hr
+combined_all_hr
+exposure_ratios_hr
+
+```
+
+# PNAS Specific Revisions
+```{r}
+# ============================================================
+# SITE URBANICITY SUMMARY — ALL SITE TYPES & ALL DISTANCES
+# ============================================================
+
+# --- 1. Load shapefile + recode NCES locale codes ---
+locale_sf <- st_read("Data/Schools/EDGE_Locale25_US/EDGE_LOCALE25_US.shp") %>%
+  mutate(
+    site_urbanicity = case_when(
+      LOCALE %in% c(11,12,13) ~ "city",
+      LOCALE %in% c(21,22,23) ~ "suburban",
+      LOCALE %in% c(31,32,33) ~ "town",
+      LOCALE %in% c(41,42,43) ~ "rural",
+      TRUE ~ NA_character_
+    )
+  )
+
+# --- 2. Align coordinate system with pollution sites ---
+locale_sf <- st_transform(locale_sf, st_crs(all_pollution_sf))
+
+# --- 3. Spatial join: assign urbanicity to each site type separately
+# This ensures all sites from each specific sf get urbanicity assigned,
+# including the 15 brownfield sites dropped during all_pollution_sf deduplication
+sites_with_locale_superfund <- st_join(superfund_sf, locale_sf) %>%
+  select(SITE_ID, site_urbanicity)
+
+sites_with_locale_brownfield <- st_join(brownfield_sf, locale_sf) %>%
+  select(SITE_ID, site_urbanicity)
+
+sites_with_locale_tri <- st_join(tri_sf, locale_sf) %>%
+  select(SITE_ID, site_urbanicity)
+
+# All pollution sites uses all_pollution_sf which is deduplicated
+# across all three site types
+sites_with_locale_all <- st_join(all_pollution_sf, locale_sf) %>%
+  select(SITE_ID, site_urbanicity)
+
+# --- 4. Check distribution across urbanicity categories ---
+table(sites_with_locale_superfund$site_urbanicity,  useNA = "ifany")
+table(sites_with_locale_brownfield$site_urbanicity, useNA = "ifany")
+table(sites_with_locale_tri$site_urbanicity,        useNA = "ifany")
+table(sites_with_locale_all$site_urbanicity,        useNA = "ifany")
+
+# --- Count sites with missing urbanicity by site type ---
+bind_rows(
+  sites_with_locale_superfund  %>% st_drop_geometry() %>% mutate(site_type = "Superfund"),
+  sites_with_locale_brownfield %>% st_drop_geometry() %>% mutate(site_type = "Brownfield"),
+  sites_with_locale_tri        %>% st_drop_geometry() %>% mutate(site_type = "TRI"),
+  sites_with_locale_all        %>% st_drop_geometry() %>% mutate(site_type = "All Pollution Sites")
+) %>%
+  group_by(site_type) %>%
+  summarise(
+    total       = n(),
+    missing     = sum(is.na(site_urbanicity)),
+    pct_missing = round(mean(is.na(site_urbanicity)) * 100, 1),
+    .groups     = "drop"
+  ) %>%
+  print()
+
+# ============================================================
+# BUILD DENOMINATORS
+# Each denom pulls from the specific site type sf so counts
+# match exactly the universe each pair dataframe was built from
+# ============================================================
+
+denom_superfund <- sites_with_locale_superfund %>%
+  st_drop_geometry() %>%
+  count(site_urbanicity, name = "total_sites")
+
+denom_brownfield <- sites_with_locale_brownfield %>%
+  st_drop_geometry() %>%
+  count(site_urbanicity, name = "total_sites")
+
+denom_tri <- sites_with_locale_tri %>%
+  st_drop_geometry() %>%
+  count(site_urbanicity, name = "total_sites")
+
+denom_all <- sites_with_locale_all %>%
+  st_drop_geometry() %>%
+  count(site_urbanicity, name = "total_sites")
+
+# ============================================================
+# ATTACH URBANICITY TO EACH PAIR DATASET
+# Each pair dataset gets urbanicity joined from its corresponding
+# sites_with_locale_* object
+# ============================================================
+
+superfund_with_urb <- all_school_superfund_pairs %>%
+  left_join(sites_with_locale_superfund %>% st_drop_geometry(), by = "SITE_ID")
+
+brownfield_with_urb <- all_school_brownfield_pairs %>%
+  left_join(sites_with_locale_brownfield %>% st_drop_geometry(), by = "SITE_ID")
+
+tri_with_urb <- all_school_tri_pairs %>%
+  left_join(sites_with_locale_tri %>% st_drop_geometry(), by = "SITE_ID")
+
+all_with_urb <- all_school_all_pairs %>%
+  left_join(sites_with_locale_all %>% st_drop_geometry(), by = "SITE_ID")
+
+# ============================================================
+# COMPUTE SUMMARY FOR EACH SITE TYPE AND DISTANCE
+# For each combination:
+#   1. Filter to the buffer distance
+#   2. Deduplicate so each site is counted once per urbanicity
+#   3. Count sites near schools by urbanicity
+#   4. Join the denominator and compute the percentage
+# ============================================================
+
+distances <- c("0.125mi", "0.25mi", "0.5mi", "1mi")
+results   <- list()
+
+for (dist in distances) {
+
+  # --- Superfund ---
+  results[[paste0("superfund_", dist)]] <- superfund_with_urb %>%
+    filter(buffer_distance == dist) %>%
+    distinct(SITE_ID, site_urbanicity) %>%
+    count(site_urbanicity, name = "sites_near_schools") %>%
+    left_join(denom_superfund, by = "site_urbanicity") %>%
+    mutate(dataset = "Superfund", buffer_distance = dist,
+           pct_near = round((sites_near_schools / total_sites) * 100, 1))
+
+  # --- Brownfield ---
+  results[[paste0("brownfield_", dist)]] <- brownfield_with_urb %>%
+    filter(buffer_distance == dist) %>%
+    distinct(SITE_ID, site_urbanicity) %>%
+    count(site_urbanicity, name = "sites_near_schools") %>%
+    left_join(denom_brownfield, by = "site_urbanicity") %>%
+    mutate(dataset = "Brownfield", buffer_distance = dist,
+           pct_near = round((sites_near_schools / total_sites) * 100, 1))
+
+  # --- TRI ---
+  results[[paste0("tri_", dist)]] <- tri_with_urb %>%
+    filter(buffer_distance == dist) %>%
+    distinct(SITE_ID, site_urbanicity) %>%
+    count(site_urbanicity, name = "sites_near_schools") %>%
+    left_join(denom_tri, by = "site_urbanicity") %>%
+    mutate(dataset = "TRI", buffer_distance = dist,
+           pct_near = round((sites_near_schools / total_sites) * 100, 1))
+
+  # --- All Pollution Sites ---
+  results[[paste0("all_", dist)]] <- all_with_urb %>%
+    filter(buffer_distance == dist) %>%
+    distinct(SITE_ID, site_urbanicity) %>%
+    count(site_urbanicity, name = "sites_near_schools") %>%
+    left_join(denom_all, by = "site_urbanicity") %>%
+    mutate(dataset = "All Pollution Sites", buffer_distance = dist,
+           pct_near = round((sites_near_schools / total_sites) * 100, 1))
+}
+
+# ============================================================
+# COMBINE ALL RESULTS INTO ONE SUMMARY TABLE
+# ============================================================
+
+site_urbanicity_summary_all <- bind_rows(results) %>%
+  select(dataset, buffer_distance, site_urbanicity, sites_near_schools, total_sites, pct_near) %>%
+  arrange(dataset, buffer_distance, site_urbanicity)
+
+site_urbanicity_summary_wide <- site_urbanicity_summary_all %>%
+  mutate(prop_near = pct_near / 100) %>%
+  select(dataset, buffer_distance, site_urbanicity, prop_near) %>%
+  pivot_wider(
+    names_from  = site_urbanicity,
+    values_from = prop_near
+  ) %>%
+  select(dataset, buffer_distance, city, suburban, town, rural, `NA`) %>%
+  arrange(dataset, buffer_distance)
+
+print(site_urbanicity_summary_all)
+print(site_urbanicity_summary_wide)
+write.csv(site_urbanicity_summary_wide, "Data/Newly Built/site_urbanicity_summary_wide.csv", row.names = FALSE)
+
+```
+
+```{r}
+# --- Replication of Currie (2011) proximity metric ---
+# Currie et al. (2011) estimates residential proximity to TRI and Superfund sites
+# in FL, MI, NJ, PA, and TX. Here we calculate the analogous school-based estimates
+# for direct comparison of school vs. residential exposure
+
+# --- 1. Generate pairs at exactly 2000m for TRI and Superfund, all schools ---
+distances_mi_2000m <- 2000 / 1609.34  # convert 2000m to miles for generate_pairs input
+distance_name_2000m <- "2000m"
+
+all_school_tri_pairs_2000m <- generate_pairs(all_school_sf, tri_sf,
+                                              "TRI", distances_mi_2000m, distance_name_2000m)
+
+all_school_superfund_pairs_2000m <- generate_pairs(all_school_sf, superfund_sf,
+                                                    "Superfund", distances_mi_2000m, distance_name_2000m)
+
+# --- 2. Define target states ---
+target_states <- c("FL", "MI", "NJ", "PA", "TX")
+
+# --- 3. School-level dataset with enrollment ---
+# coalesce handles the fact that public and private use different enrollment columns
+all_school_clean_enroll <- bind_rows(
+  public_school_clean %>% mutate(school_type = "Public"),
+  private_school_clean %>% mutate(school_type = "Private")
+) %>%
+  mutate(total_students = coalesce(Total_Students_Public_2023_24,
+                                   Total_Students_Private_2019_20))
+
+# --- 4. Total schools and students in target states (denominators) ---
+total_by_state <- all_school_clean_enroll %>%
+  filter(STATE %in% target_states) %>%
+  group_by(STATE) %>%
+  summarise(
+    total_schools  = n_distinct(SCHOOL_ID),
+    total_students = sum(total_students, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# --- 5. Helper to get near-site counts by state ---
+near_site_by_state <- function(pairs_2000m, site_label) {
+  pairs_2000m %>%
+    left_join(
+      all_school_clean_enroll %>% select(SCHOOL_ID, STATE, total_students),
+      by = "SCHOOL_ID"
+    ) %>%
+    filter(STATE %in% target_states) %>%
+    distinct(SCHOOL_ID, .keep_all = TRUE) %>%
+    group_by(STATE) %>%
+    summarise(
+      !!paste0("schools_near_", site_label) := n_distinct(SCHOOL_ID),
+      !!paste0("students_near_", site_label) := sum(total_students, na.rm = TRUE),
+      .groups = "drop"
+    )
+}
+
+near_tri_by_state       <- near_site_by_state(all_school_tri_pairs_2000m,       "tri")
+near_superfund_by_state <- near_site_by_state(all_school_superfund_pairs_2000m, "superfund")
+
+# --- 6. State-level summary table ---
+state_summary_currie <- total_by_state %>%
+  left_join(near_tri_by_state,       by = "STATE") %>%
+  left_join(near_superfund_by_state, by = "STATE") %>%
+  mutate(
+    pct_schools_near_tri        = round(schools_near_tri        / total_schools  * 100, 1),
+    pct_students_near_tri       = round(students_near_tri       / total_students * 100, 1),
+    pct_schools_near_superfund  = round(schools_near_superfund  / total_schools  * 100, 1),
+    pct_students_near_superfund = round(students_near_superfund / total_students * 100, 1)
+  )
+
+# --- 7. Combined 5-state totals row ---
+totals_row <- state_summary_currie %>%
+  summarise(
+    STATE                       = "TOTAL (5 states)",
+    total_schools               = sum(total_schools),
+    total_students              = sum(total_students),
+    schools_near_tri            = sum(schools_near_tri),
+    students_near_tri           = sum(students_near_tri),
+    schools_near_superfund      = sum(schools_near_superfund),
+    students_near_superfund     = sum(students_near_superfund),
+    pct_schools_near_tri        = round(schools_near_tri        / total_schools  * 100, 1),
+    pct_students_near_tri       = round(students_near_tri       / total_students * 100, 1),
+    pct_schools_near_superfund  = round(schools_near_superfund  / total_schools  * 100, 1),
+    pct_students_near_superfund = round(students_near_superfund / total_students * 100, 1)
+  )
+
+# --- 8. Print final table ---
+currie_comparison_table <- bind_rows(state_summary_currie, totals_row)
+
+currie_comparison_table %>% select(STATE, total_schools, total_students, schools_near_superfund, students_near_superfund, pct_schools_near_superfund, pct_students_near_superfund) %>% print(row.names = FALSE)
+
+```
+
+```{r}
+# --- Validation: State-level blood lead levels vs school proximity to pollution sites ---
+# Correlates % of children with confirmed blood lead levels (≥3.5 and ≥5 µg/dL) by state
+# with the proportion of schools within 0.25 miles of any pollution site
+# Higher school proximity to pollution sites should predict higher blood lead rates
+
+# --- 1. Build all_school_clean (also used in Figure 2 and Grace's state summary table) ---
+all_school_clean <- bind_rows(
+  public_school_clean %>% mutate(school_type = "Public"),
+  private_school_clean %>% mutate(school_type = "Private")
+)
+
+# --- 2. Build quarter_mile_summary and state_crosswalk (also used in Figures 3 and 4) ---
+total_schools_state <- all_school_clean %>%
+  group_by(STATE) %>%
+  summarise(total_schools = n_distinct(SCHOOL_ID), .groups = "drop")
+
+quarter_mile_summary <- all_all_summary$state %>%
+  filter(buffer_distance == "0.25mi") %>%
+  left_join(total_schools_state, by = "STATE") %>%
+  mutate(prop_near_site = unique_schools / total_schools) %>%
+  rename(state = STATE)
+
+state_crosswalk <- tibble(
+  state_abbrev = state.abb,
+  state_name   = state.name
+) %>%
+  bind_rows(
+    tibble(state_abbrev = "DC", state_name = "District of Columbia"),
+    tibble(state_abbrev = "PR", state_name = "Puerto Rico")
+  )
+
+# --- 3. Load and clean blood lead data ---
+clean_lead <- function(path) {
+  suppressWarnings(
+    read.csv(path) %>%
+      mutate(
+        Value  = as.numeric(gsub("%", "", Value)),
+        Number = as.numeric(gsub(",", "", Number))
+      )
+  )
+}
+
+child_lead_3.5_data <- clean_lead("Data/Misc/child_lead_3.5_micrograms/data_165415.csv")
+child_lead_5_data   <- clean_lead("Data/Misc/child_lead_5_micrograms/data_165805.csv")
+
+# --- 4. Join blood lead data with school proximity by state ---
+join_lead <- function(lead_df) {
+  lead_df %>%
+    left_join(state_crosswalk, by = c("State" = "state_name")) %>%
+    rename(state = state_abbrev) %>%
+    left_join(quarter_mile_summary %>% select(state, prop_near_site), by = "state") %>%
+    filter(!is.na(Value), !is.na(prop_near_site))
+}
+
+child_lead_3.5_joined <- join_lead(child_lead_3.5_data)
+child_lead_5_joined   <- join_lead(child_lead_5_data)
+
+# --- 5. Correlations ---
+cor_3.5 <- cor.test(child_lead_3.5_joined$prop_near_site, child_lead_3.5_joined$Value, method = "pearson")
+cor_5   <- cor.test(child_lead_5_joined$prop_near_site,   child_lead_5_joined$Value,   method = "pearson")
+
+cat("Correlation (3.5 µg/dL threshold):", round(cor_3.5$estimate, 3), "p-value:", round(cor_3.5$p.value, 4), "\n")
+cat("Correlation (5 µg/dL threshold):",   round(cor_5$estimate, 3),   "p-value:", round(cor_5$p.value, 4), "\n")
+
+# --- 6. Check missing states ---
+states_proximity <- quarter_mile_summary %>% pull(state)
+states_lead_3.5  <- child_lead_3.5_data %>% left_join(state_crosswalk, by = c("State" = "state_name")) %>% pull(state_abbrev)
+states_lead_5    <- child_lead_5_data   %>% left_join(state_crosswalk, by = c("State" = "state_name")) %>% pull(state_abbrev)
+
+cat("In proximity but missing from 3.5 data:", paste(setdiff(states_proximity, states_lead_3.5), collapse = ", "), "\n")
+cat("In proximity but missing from 5.0 data:", paste(setdiff(states_proximity, states_lead_5),   collapse = ", "), "\n")
+cat("In 3.5 data but missing from proximity:", paste(setdiff(states_lead_3.5, states_proximity), collapse = ", "), "\n")
+cat("In 5.0 data but missing from proximity:", paste(setdiff(states_lead_5,   states_proximity), collapse = ", "), "\n")
+
+cat("States in final 3.5 correlation:", nrow(child_lead_3.5_joined), "\n")
+cat("States in final 5.0 correlation:", nrow(child_lead_5_joined),   "\n")
+
+```
+
+```{r}
+# ============================================================
+# School-Level Pollution Proximity Dataset (requested by Matt, 5/4/26)
+# Combines public and private schools into one school-level file with:
+# - 1/0 proximity indicators for each site type and buffer distance
+# - Student demographic proportions
+# - Urbanicity, state, county, and ZIP code
+# ============================================================
+
+# --- 1. Load geographic data ---
+# Public school geo file uses NCESSCH as the school ID
+geo_public <- read.csv("Data/Schools/Public/EDGE_GEOCODE_PUBLICSCH_2324/EDGE_GEOCODE_PUBLICSCH_2324/EDGE_GEOCODE_PUBLICSCH_2324.csv",
+                       colClasses = c("NCESSCH" = "character")) %>%
+  select(NCESSCH, ZIP, CNTY, NMCNTY) %>%
+  rename(SCHOOL_ID = NCESSCH)
+
+# Private school geo file uses PPIN as the school ID
+geo_private <- read.csv("Data/Schools/Private/EDGE_GEOCODE_PRIVATESCH_2324/EDGE_GEOCODE_PRIVATESCH_2324.csv",
+                        colClasses = c("PPIN" = "character")) %>%
+  select(PPIN, ZIP, CNTY, NMCNTY) %>%
+  rename(SCHOOL_ID = PPIN)
+
+# --- 2. Build base school-level dataset ---
+# Public and private are bound together with a school_type indicator
+# Private schools have NA for FRL, IDEA, and EL since that data is not collected
+school_base <- bind_rows(
+  public_school_clean %>%
+    mutate(school_type = "Public") %>%
+    left_join(geo_public, by = "SCHOOL_ID") %>%
+    select(
+      SCHOOL_ID, school_type, STATE, urbanicity,
+      ZIP, CNTY, NMCNTY,
+      total_students = Total_Students_Public_2023_24,
+      prop_frl, prop_black, prop_hispanic, prop_native,
+      prop_hawaiian, prop_asian, prop_white,
+      SCH_ENR_IDEA_TOTAL, SCH_ENR_EL_TOTAL
+    ),
+  
+  private_school_clean %>%
+    mutate(school_type = "Private") %>%
+    left_join(geo_private, by = "SCHOOL_ID") %>%
+    select(
+      SCHOOL_ID, school_type, STATE, urbanicity,
+      ZIP, CNTY, NMCNTY,
+      total_students = Total_Students_Private_2019_20,
+      prop_black, prop_hispanic, prop_native,
+      prop_hawaiian, prop_asian, prop_white
+    )
+)
+
+# --- 3. Build 1/0 proximity indicators for each site type and distance ---
+# For each combination: 1 = school has at least one site within that distance, 0 = none
+# Each left_join brings in schools that have a nearby site, NAs filled with 0 at the end
+
+proximity_indicators <- school_base %>%
+  select(SCHOOL_ID) %>%
+
+  # --- Superfund ---
+  left_join(all_school_superfund_pairs %>% filter(buffer_distance == "0.125mi") %>% distinct(SCHOOL_ID) %>% mutate(Superfund_0125mi = 1), by = "SCHOOL_ID") %>%
+  left_join(all_school_superfund_pairs %>% filter(buffer_distance == "0.25mi")  %>% distinct(SCHOOL_ID) %>% mutate(Superfund_025mi  = 1), by = "SCHOOL_ID") %>%
+  left_join(all_school_superfund_pairs %>% filter(buffer_distance == "0.5mi")   %>% distinct(SCHOOL_ID) %>% mutate(Superfund_05mi   = 1), by = "SCHOOL_ID") %>%
+  left_join(all_school_superfund_pairs %>% filter(buffer_distance == "1mi")     %>% distinct(SCHOOL_ID) %>% mutate(Superfund_1mi    = 1), by = "SCHOOL_ID") %>%
+
+  # --- Brownfield ---
+  left_join(all_school_brownfield_pairs %>% filter(buffer_distance == "0.125mi") %>% distinct(SCHOOL_ID) %>% mutate(Brownfield_0125mi = 1), by = "SCHOOL_ID") %>%
+  left_join(all_school_brownfield_pairs %>% filter(buffer_distance == "0.25mi")  %>% distinct(SCHOOL_ID) %>% mutate(Brownfield_025mi  = 1), by = "SCHOOL_ID") %>%
+  left_join(all_school_brownfield_pairs %>% filter(buffer_distance == "0.5mi")   %>% distinct(SCHOOL_ID) %>% mutate(Brownfield_05mi   = 1), by = "SCHOOL_ID") %>%
+  left_join(all_school_brownfield_pairs %>% filter(buffer_distance == "1mi")     %>% distinct(SCHOOL_ID) %>% mutate(Brownfield_1mi    = 1), by = "SCHOOL_ID") %>%
+
+  # --- TRI ---
+  left_join(all_school_tri_pairs %>% filter(buffer_distance == "0.125mi") %>% distinct(SCHOOL_ID) %>% mutate(TRI_0125mi = 1), by = "SCHOOL_ID") %>%
+  left_join(all_school_tri_pairs %>% filter(buffer_distance == "0.25mi")  %>% distinct(SCHOOL_ID) %>% mutate(TRI_025mi  = 1), by = "SCHOOL_ID") %>%
+  left_join(all_school_tri_pairs %>% filter(buffer_distance == "0.5mi")   %>% distinct(SCHOOL_ID) %>% mutate(TRI_05mi   = 1), by = "SCHOOL_ID") %>%
+  left_join(all_school_tri_pairs %>% filter(buffer_distance == "1mi")     %>% distinct(SCHOOL_ID) %>% mutate(TRI_1mi    = 1), by = "SCHOOL_ID") %>%
+
+  # --- All Pollution Sites ---
+  left_join(all_school_all_pairs %>% filter(buffer_distance == "0.125mi") %>% distinct(SCHOOL_ID) %>% mutate(All_Pollution_Sites_0125mi = 1), by = "SCHOOL_ID") %>%
+  left_join(all_school_all_pairs %>% filter(buffer_distance == "0.25mi")  %>% distinct(SCHOOL_ID) %>% mutate(All_Pollution_Sites_025mi  = 1), by = "SCHOOL_ID") %>%
+  left_join(all_school_all_pairs %>% filter(buffer_distance == "0.5mi")   %>% distinct(SCHOOL_ID) %>% mutate(All_Pollution_Sites_05mi   = 1), by = "SCHOOL_ID") %>%
+  left_join(all_school_all_pairs %>% filter(buffer_distance == "1mi")     %>% distinct(SCHOOL_ID) %>% mutate(All_Pollution_Sites_1mi    = 1), by = "SCHOOL_ID") %>%
+
+  # Fill all NAs with 0 — schools with no nearby sites get 0 for that indicator
+  mutate(across(where(is.numeric), ~replace_na(., 0)))
+
+# --- 4. Join proximity indicators onto school base dataset ---
+school_level_pollution_proximity <- school_base %>%
+  left_join(proximity_indicators, by = "SCHOOL_ID")
+
+# --- 5. Export to CSV ---
+write.csv(school_level_pollution_proximity, "Data/Newly Built/school_level_pollution_proximity.csv", row.names = FALSE)
+
+cat("Rows:", nrow(school_level_pollution_proximity), "\n")
+cat("Columns:", ncol(school_level_pollution_proximity), "\n")
+print(head(school_level_pollution_proximity))
+
+```
+
+# Figures and Tables
+```{r}
+# =========================================
+# Figure 1: Public vs Private
+# =========================================
+
+# High Risk Sites (Public vs Private Comparison)
+
+# Combine public and private schools into one table
+all_schools_with_type <- bind_rows(
+  public_school_sf %>% st_drop_geometry() %>% select(SCHOOL_ID) %>% mutate(school_type = "Public"),
+  private_school_sf %>% st_drop_geometry() %>% select(SCHOOL_ID) %>% mutate(school_type = "Private")
+)
+
+# Join to all_school_all_pairs into a new object
+all_school_all_pairs_with_type <- all_school_all_pairs %>%
+  left_join(all_schools_with_type, by = "SCHOOL_ID")
+
+# Optional: check for missing school types
+missing_types <- all_school_all_pairs_with_type %>% filter(is.na(school_type))
+if(nrow(missing_types) > 0){
+  warning(paste("There are", nrow(missing_types), "schools without a type!"))
+}
+
+# Compute proximity to high-risk sites and summarize
+school_level_by_type <- all_school_all_pairs_with_type %>%
+  left_join(
+    all_pollution_highrisk_sf %>% st_drop_geometry() %>% select(SITE_ID, HighRisk_flag),
+    by = "SITE_ID"
+  ) %>%
+  mutate(HighRisk_flag = ifelse(is.na(HighRisk_flag), FALSE, HighRisk_flag)) %>%
+  group_by(buffer_distance, SCHOOL_ID, school_type) %>%
+  summarise(any_highrisk = any(HighRisk_flag), .groups = "drop") %>%
+  group_by(buffer_distance, any_highrisk, school_type) %>%
+  summarise(n_schools = n(), .groups = "drop") %>%
+  mutate(
+    prop_unique = case_when(
+      school_type == "Public" ~ round(n_schools / n_public, 2),
+      school_type == "Private" ~ round(n_schools / n_private, 2)
+    ),
+    interpretation = ifelse(any_highrisk,
+                            "Schools with ≥1 high-risk site nearby",
+                            "Schools with 0 high-risk sites nearby")
+  ) %>%
+  ungroup()
+
+print(school_level_by_type)
+
+# Prepare higher-risk public vs private data for plotting
+highrisk_plot_data <- school_level_by_type %>%
+  filter(any_highrisk == TRUE) %>%   # only schools near high-risk sites
+  mutate(
+    school_type = factor(school_type, levels = c("Public", "Private")),
+    source = "Higher-Risk Sites"    # optional label if you want facets
+  )
+
+# PLOT BOTH ALL SITES AND HIGHER RISK SITES
+
+# 1️⃣ Add a 'source' column to both datasets
+combined_national_public_private_all <- bind_rows(
+  combined_national_public %>% mutate(school_type = "Public"),
+  combined_national_private %>% mutate(school_type = "Private")
+) %>%
+  filter(source == "All Pollution Sites") %>%
+  mutate(school_type = factor(school_type, levels = c("Public", "Private"))) %>%
+  mutate(source = "All Pollution Sites")
+
+highrisk_plot_data <- highrisk_plot_data %>%
+  mutate(source = "Higher-Risk Sites")
+
+# 2️⃣ Combine both datasets
+combined_plot_data <- bind_rows(
+  combined_national_public_private_all,
+  highrisk_plot_data
+)
+
+# 3️⃣ Plot faceted by 'source' for side-by-side comparison
+fig1 <- 
+ggplot(combined_plot_data, aes(x = buffer_distance, y = prop_unique, fill = school_type)) +
+  geom_col(position = position_dodge(width = 0.8), width = 0.7) +
+  geom_text(
+    aes(label = scales::percent(prop_unique, accuracy = 1)),
+    position = position_dodge(width = 0.8),
+    vjust = -0.3,
+    size = 3.5
+  ) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1),
+                     expand = expansion(mult = c(0, 0.1))) +
+  facet_wrap(~source) +  # separates All Sites vs Higher-Risk
+  labs(
+    # title = "Proportion of Schools Near Pollution Sites by School Type",
+    x = "Distance",
+    y = "% of Schools",
+    fill = "School Type"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    axis.text.x = element_text(hjust = 1),
+    legend.position = "bottom"
+  )
+
+print(fig1)
+
+```
+
+```{r}
+# =========================================
+# Figure 2: Student Composition Near Pollution Sites
+# =========================================
+
+# --- Helper function for pivoting & recoding ---
+pivot_and_recode <- function(df, col_map, source_name) {
+  df %>%
+    pivot_longer(
+      cols = names(col_map),
+      names_to = "group",
+      values_to = "proportion"
+    ) %>%
+    mutate(
+      group  = recode(group, !!!col_map),
+      source = source_name
+    )
+}
+
+# --- 1a. Race proportions (All Schools, 0.25mi) ---
+race_props <- combined_all %>%
+  filter(
+    school_type     == "All Schools (Public and Private)",
+    site_type       == "All Pollution Sites",
+    buffer_distance == "0.25mi"
+  ) %>%
+  select(prob_Black, prob_Hispanic, prob_Native,
+         prob_Hawaiian, prob_Asian, prob_White) %>%
+  pivot_and_recode(
+    col_map = c(
+      prob_Black    = "Black",
+      prob_Hispanic = "Hispanic",
+      prob_Native   = "Native",
+      prob_Hawaiian = "Hawaiian",
+      prob_Asian    = "Asian",
+      prob_White    = "White"
+    ),
+    source_name = "Race (All Schools)"
+  )
+
+# --- 1b. Program proportions (Public only, 0.25mi) ---
+program_props <- combined_public %>%
+  filter(
+    school_type     == "Public",
+    site_type       == "All Pollution Sites",
+    buffer_distance == "0.25mi"
+  ) %>%
+  select(prob_FRL, prob_NonFRL,
+         prob_EL, prob_NonEL,
+         prob_IDEA, prob_NonIDEA) %>%
+  pivot_and_recode(
+    col_map = c(
+      prob_FRL    = "FRPL",
+      prob_NonFRL = "Non-FRPL",
+      prob_EL     = "EL",
+      prob_NonEL  = "Non-EL",
+      prob_IDEA   = "SWD",
+      prob_NonIDEA = "Non-SWD"
+    ),
+    source_name = "Programs (Public Only)"
+  )
+
+# --- 1c. Combine into char_df ---
+char_df <- bind_rows(race_props, program_props) %>%
+  arrange(proportion) %>%
+  mutate(group = factor(group, levels = unique(group)))
+
+# --- 2. Count pollution sites per school (for 2+ site bin) ---
+# all_school_clean already built in blood lead validation chunk
+
+school_with_sites <- all_school_clean %>%
+  left_join(
+    bind_rows(
+      all_sites_full_public  %>% mutate(school_type = "Public"),
+      all_sites_full_private %>% mutate(school_type = "Private")
+    ) %>%
+      filter(site_type == "All Pollution Sites", buffer_distance == "0.25mi") %>%
+      count(SCHOOL_ID, name = "n_sites"),
+    by = "SCHOOL_ID"
+  ) %>%
+  mutate(
+    n_sites  = replace_na(n_sites, 0),
+    site_bin = case_when(
+      n_sites >= 2 ~ "2+",
+      n_sites == 1 ~ "1",
+      TRUE         ~ "0"
+    ),
+    site_bin = factor(site_bin, levels = c("2+", "1", "0"))
+  )
+
+# --- 3. Summarize students by site bin ---
+student_props <- school_with_sites %>%
+  group_by(school_type, site_bin) %>%
+  summarise(
+    FRL      = if (school_type[1] == "Public") sum(FRL_Students_Public_2023_24,                                    na.rm = TRUE) else NA_real_,
+    NonFRL   = if (school_type[1] == "Public") sum(Total_Students_Public_2023_24 - FRL_Students_Public_2023_24,   na.rm = TRUE) else NA_real_,
+    EL       = if (school_type[1] == "Public") sum(SCH_ENR_EL_TOTAL,                                              na.rm = TRUE) else NA_real_,
+    NonEL    = if (school_type[1] == "Public") sum(Total_Students_Public_2023_24 - SCH_ENR_EL_TOTAL,              na.rm = TRUE) else NA_real_,
+    IDEA     = if (school_type[1] == "Public") sum(SCH_ENR_IDEA_TOTAL,                                            na.rm = TRUE) else NA_real_,
+    NonIDEA  = if (school_type[1] == "Public") sum(Total_Students_Public_2023_24 - SCH_ENR_IDEA_TOTAL,            na.rm = TRUE) else NA_real_,
+    Black    = if (school_type[1] == "Public") sum(Black_Students_Public_2023_24,    na.rm = TRUE) else sum(Black_Students_Private_2019_20,    na.rm = TRUE),
+    Hispanic = if (school_type[1] == "Public") sum(Hispanic_Students_Public_2023_24, na.rm = TRUE) else sum(Hispanic_Students_Private_2019_20, na.rm = TRUE),
+    Native   = if (school_type[1] == "Public") sum(Native_Students_Public_2023_24,   na.rm = TRUE) else sum(Native_Students_Private_2019_20,   na.rm = TRUE),
+    Hawaiian = if (school_type[1] == "Public") sum(Hawaiian_Students_Public_2023_24, na.rm = TRUE) else sum(Hawaiian_Students_Private_2019_20, na.rm = TRUE),
+    Asian    = if (school_type[1] == "Public") sum(Asian_Students_Public_2023_24,    na.rm = TRUE) else sum(Asian_Students_Private_2019_20,    na.rm = TRUE),
+    White    = if (school_type[1] == "Public") sum(White_Students_Public_2023_24,    na.rm = TRUE) else sum(White_Students_Private_2019_20,    na.rm = TRUE),
+    Total    = if (school_type[1] == "Public") sum(Total_Students_Public_2023_24,    na.rm = TRUE) else sum(Total_Students_Private_2019_20,    na.rm = TRUE),
+    .groups  = "drop"
+  )
+
+# --- 3a. Combined totals (all schools) ---
+combined_props <- student_props %>%
+  group_by(site_bin) %>%
+  summarise(
+    FRL = NA_real_, NonFRL = NA_real_,
+    EL  = NA_real_, NonEL  = NA_real_,
+    IDEA = NA_real_, NonIDEA = NA_real_,
+    Black    = sum(Black,    na.rm = TRUE),
+    Hispanic = sum(Hispanic, na.rm = TRUE),
+    Native   = sum(Native,   na.rm = TRUE),
+    Hawaiian = sum(Hawaiian, na.rm = TRUE),
+    Asian    = sum(Asian,    na.rm = TRUE),
+    White    = sum(White,    na.rm = TRUE),
+    Total    = sum(Total,    na.rm = TRUE),
+    .groups  = "drop"
+  ) %>%
+  mutate(school_type = "All Schools")
+
+# --- 4a. Race props for 2+ sites (all schools) ---
+race_2plus <- combined_props %>%
+  filter(site_bin == "2+") %>%
+  pivot_longer(cols = Black:White, names_to = "group", values_to = "count") %>%
+  group_by(group) %>%
+  mutate(prop = count / sum(combined_props[[group]], na.rm = TRUE) * 100) %>%
+  ungroup() %>%
+  mutate(source = "Race (All Schools)")
+
+# --- 4b. Program props for 2+ sites (public only) ---
+program_2plus <- student_props %>%
+  filter(site_bin == "2+", school_type == "Public") %>%
+  pivot_longer(cols = c(FRL, NonFRL, EL, NonEL, IDEA, NonIDEA),
+               names_to = "group", values_to = "count") %>%
+  group_by(group) %>%
+  mutate(prop = count / sum(student_props[[group]], na.rm = TRUE) * 100) %>%
+  ungroup() %>%
+  mutate(
+    group = recode(group,
+                   FRL     = "FRPL",    NonFRL  = "Non-FRPL",
+                   EL      = "EL",      NonEL   = "Non-EL",
+                   IDEA    = "SWD",     NonIDEA = "Non-SWD"),
+    source = "Programs (Public Only)"
+  )
+
+# --- 4c. Combine into char_df_2plus ---
+char_df_2plus <- bind_rows(race_2plus, program_2plus) %>%
+  arrange(prop) %>%
+  mutate(group = factor(group, levels = unique(group)))
+
+# =========================================
+# Figure 2A & 2B: PNAS Split Figures
+# =========================================
+
+# --- 1. Build combined dataset ---
+combined_quarter_twoplus_df_PNAS <- bind_rows(
+  char_df %>%
+    mutate(scenario = "within 0.25 miles of any site", value = proportion),
+  char_df_2plus %>%
+    mutate(scenario = "within 0.25 miles of 2+ sites", value = prop / 100)
+)
+
+# --- 2. Define analytic structure ---
+# Assign category labels, reference group flags, and round values for display
+combined_quarter_twoplus_df_PNAS <- combined_quarter_twoplus_df_PNAS %>%
+  mutate(
+    category = case_when(
+      group %in% c("Black","Hispanic","Native","Hawaiian","Asian","White") ~ "Race",
+      group %in% c("FRPL","Non-FRPL")                                      ~ "FRPL",
+      group %in% c("EL","Non-EL")                                          ~ "EL",
+      group %in% c("SWD","Non-SWD")                                        ~ "SWD"
+    ),
+    is_ref        = group %in% c("White","Non-FRPL","Non-EL","Non-SWD"),
+    scenario      = factor(scenario, levels = c("within 0.25 miles of any site",
+                                                "within 0.25 miles of 2+ sites")),
+    value_rounded = round(value, 3)
+  )
+
+# --- 3. Get reference values using rounded values ---
+ref_white_any   <- combined_quarter_twoplus_df_PNAS %>% filter(group == "White",    scenario == "within 0.25 miles of any site") %>% pull(value_rounded)
+ref_white_2plus <- combined_quarter_twoplus_df_PNAS %>% filter(group == "White",    scenario == "within 0.25 miles of 2+ sites") %>% pull(value_rounded)
+ref_frpl_any    <- combined_quarter_twoplus_df_PNAS %>% filter(group == "Non-FRPL", scenario == "within 0.25 miles of any site") %>% pull(value_rounded)
+ref_frpl_2plus  <- combined_quarter_twoplus_df_PNAS %>% filter(group == "Non-FRPL", scenario == "within 0.25 miles of 2+ sites") %>% pull(value_rounded)
+ref_el_any      <- combined_quarter_twoplus_df_PNAS %>% filter(group == "Non-EL",   scenario == "within 0.25 miles of any site") %>% pull(value_rounded)
+ref_el_2plus    <- combined_quarter_twoplus_df_PNAS %>% filter(group == "Non-EL",   scenario == "within 0.25 miles of 2+ sites") %>% pull(value_rounded)
+ref_swd_any     <- combined_quarter_twoplus_df_PNAS %>% filter(group == "Non-SWD",  scenario == "within 0.25 miles of any site") %>% pull(value_rounded)
+ref_swd_2plus   <- combined_quarter_twoplus_df_PNAS %>% filter(group == "Non-SWD",  scenario == "within 0.25 miles of 2+ sites") %>% pull(value_rounded)
+
+# --- 4. Compute disparity ratios from rounded values ---
+# Ratios computed from same rounded values shown on bar labels for consistency
+disparity_ratios <- combined_quarter_twoplus_df_PNAS %>%
+  mutate(
+    disparity_ratio = case_when(
+      is_ref ~ NA_real_,
+      category == "Race" & scenario == "within 0.25 miles of any site"  ~ round(value_rounded / ref_white_any,   2),
+      category == "Race" & scenario == "within 0.25 miles of 2+ sites"  ~ round(value_rounded / ref_white_2plus,  2),
+      category == "FRPL" & scenario == "within 0.25 miles of any site"  ~ round(value_rounded / ref_frpl_any,    2),
+      category == "FRPL" & scenario == "within 0.25 miles of 2+ sites"  ~ round(value_rounded / ref_frpl_2plus,   2),
+      category == "EL"   & scenario == "within 0.25 miles of any site"  ~ round(value_rounded / ref_el_any,      2),
+      category == "EL"   & scenario == "within 0.25 miles of 2+ sites"  ~ round(value_rounded / ref_el_2plus,     2),
+      category == "SWD"  & scenario == "within 0.25 miles of any site"  ~ round(value_rounded / ref_swd_any,     2),
+      category == "SWD"  & scenario == "within 0.25 miles of 2+ sites"  ~ round(value_rounded / ref_swd_2plus,    2)
+    )
+  )
+
+# --- 5. Order race groups low to high by "any site" value, keeping White first ---
+race_order <- disparity_ratios %>%
+  filter(category == "Race", scenario == "within 0.25 miles of any site", !is_ref) %>%
+  arrange(value_rounded) %>%
+  pull(group) %>%
+  as.character()
+
+group_levels <- c("White", race_order,
+                  "Non-FRPL", "FRPL",
+                  "Non-EL",   "EL",
+                  "Non-SWD",  "SWD")
+
+disparity_ratios <- disparity_ratios %>%
+  mutate(group = factor(group, levels = group_levels))
+
+# =========================================
+# Figure 2A: Within 0.25 miles of any site
+# Y axis: 0-12% in 3% intervals
+# =========================================
+
+plot_data_2a <- disparity_ratios %>%
+  filter(scenario == "within 0.25 miles of any site") %>%
+  mutate(
+    fill_group = factor(
+      ifelse(is_ref, "Reference group", "Comparison group"),
+      levels = c("Reference group", "Comparison group")
+    )
+  )
+
+ratio_labels_2a <- plot_data_2a %>%
+  filter(!is.na(disparity_ratio)) %>%
+  group_by(category, group) %>%
+  summarise(
+    label_y         = value + 0.03,
+    disparity_ratio = disparity_ratio,
+    .groups         = "drop"
+  )
+
+fig2a <- ggplot(plot_data_2a, aes(x = group, y = value, fill = fill_group)) +
+  geom_col(width = 0.45) +
+  geom_text(
+    aes(label = scales::percent(value_rounded, accuracy = 0.1)),
+    vjust = -0.3,
+    size  = 2.5
+  ) +
+  geom_text(
+    data        = ratio_labels_2a,
+    aes(x = group, y = label_y, label = paste0(disparity_ratio, "x")),
+    inherit.aes = FALSE,
+    vjust       = -0.3,
+    size        = 3.0,
+    color       = "gray20",
+    fontface    = "bold.italic"
+  ) +
+  facet_wrap(~category, scales = "free_x",
+           labeller = as_labeller(c(
+             "Race" = "Race",
+             "FRPL" = "Free or Reduced-Price Lunch (FRPL)",
+             "EL"   = "English Learner (EL)",
+             "SWD"  = "Students with Disabilities (SWD)"
+           ))) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0, 0.12, by = 0.03),
+    limits = c(0, 0.16),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  scale_fill_manual(
+    values = c("Reference group" = "#1b9e77", "Comparison group" = "#a6dba0")
+  ) +
+  guides(fill = guide_legend(ncol = 2)) +
+  labs(x = NULL, y = "% of Students", fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title         = element_text(hjust = 0.5, face = "bold"),
+    legend.position    = "bottom",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    axis.text.x        = element_text(angle = 45, hjust = 1, size = 8)
+  )
+
+# =========================================
+# Figure 2B: Within 0.25 miles of 2+ sites
+# Y axis: 0-5% in 1% intervals
+# =========================================
+
+plot_data_2b <- disparity_ratios %>%
+  filter(scenario == "within 0.25 miles of 2+ sites") %>%
+  mutate(
+    fill_group = factor(
+      ifelse(is_ref, "Reference group", "Comparison group"),
+      levels = c("Reference group", "Comparison group")
+    )
+  )
+
+ratio_labels_2b <- plot_data_2b %>%
+  filter(!is.na(disparity_ratio)) %>%
+  group_by(category, group) %>%
+  summarise(
+    label_y         = value + 0.008,
+    disparity_ratio = disparity_ratio,
+    .groups         = "drop"
+  )
+
+fig2b <- ggplot(plot_data_2b, aes(x = group, y = value, fill = fill_group)) +
+  geom_col(width = 0.45) +
+  geom_text(
+    aes(label = scales::percent(value_rounded, accuracy = 0.1)),
+    vjust = -0.3,
+    size  = 2.5
+  ) +
+  geom_text(
+    data        = ratio_labels_2b,
+    aes(x = group, y = label_y, label = paste0(disparity_ratio, "x")),
+    inherit.aes = FALSE,
+    vjust       = -0.3,
+    size        = 3.0,
+    color       = "gray20",
+    fontface    = "bold.italic"
+  ) +
+  facet_wrap(~category, scales = "free_x",
+           labeller = as_labeller(c(
+             "Race" = "Race",
+             "FRPL" = "Free or Reduced-Price Lunch (FRPL)",
+             "EL"   = "English Learner (EL)",
+             "SWD"  = "Students with Disabilities (SWD)"
+           ))) +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    breaks = seq(0, 0.05, by = 0.01),
+    limits = c(0, 0.08),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  scale_fill_manual(
+    values = c("Reference group" = "#d95f02", "Comparison group" = "#fddbc7")
+  ) +
+  guides(fill = guide_legend(ncol = 2)) +
+  labs(x = NULL, y = "% of Students", fill = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title         = element_text(hjust = 0.5, face = "bold"),
+    legend.position    = "bottom",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank(),
+    axis.text.x        = element_text(angle = 45, hjust = 1, size = 8)
+  )
+
+print(fig2a)
+print(fig2b)
+
+```
+
+```{r}
+# =========================================
+# Figure 3: Choropleth Map — Schools Within Quarter Mile of Pollution Sites
+# Also computes:
+#   - Region-level summary aggregating proportions across Census regions (region_summary)
+#   - Flags non-state entities excluded from regional groupings
+# Note: quarter_mile_summary and total_schools_state built in blood lead validation chunk
+# =========================================
+
+# Plot the choropleth
+quarter_mile_summary <- quarter_mile_summary %>%
+  mutate(
+    prop_band = case_when(
+      prop_near_site < 0.05 ~ "< 5%",
+      prop_near_site < 0.10 ~ "5-10%",
+      prop_near_site < 0.15 ~ "10-15%",
+      prop_near_site < 0.20 ~ "15-20%",
+      TRUE                  ~ ">=20%"
+    ),
+    prop_band = factor(prop_band, levels = c("< 5%", "5-10%", "10-15%", "15-20%", ">=20%"))
+  )
+
+fig3 <- 
+plot_usmap(data = quarter_mile_summary, values = "prop_band") +
+  scale_fill_manual(
+    values = c(
+      "< 5%"   = "#c6dbef",
+      "5-10%"  = "#6baed6",
+      "10-15%" = "#2171b5",
+      "15-20%" = "#084594",
+      ">=20%"   = "#08306b"
+    ),
+    name = "% of Schools in Each State (Public + Private)\nWithin a Quarter Mile of a Pollution Site"
+  ) +
+  theme(
+    legend.position = "bottom",
+    plot.title      = element_text(hjust = 0.5)
+  ) +
+  labs(title = "")
+
+# Region Summary
+state_regions <- tibble(
+  STATE = c(
+    # Northeast
+    "CT", "ME", "MA", "NH", "RI", "VT", "NJ", "NY", "PA",
+    # Midwest
+    "IL", "IN", "MI", "OH", "WI", "IA", "KS", "MN", "MO", "NE", "ND", "SD",
+    # South
+    "DE", "DC", "FL", "GA", "MD", "NC", "SC", "VA", "WV", "AL", "KY", "MS", "TN", "AR", "LA", "OK", "TX",
+    # West
+    "AZ", "CO", "ID", "MT", "NV", "NM", "UT", "WY", "AK", "CA", "HI", "OR", "WA"
+  ),
+  REGION = c(
+    # Northeast
+    rep("Northeast", 9),
+    # Midwest
+    rep("Midwest", 12),
+    # South
+    rep("South", 17),
+    # West
+    rep("West", 13)
+  )
+)
+
+quarter_mile_summary_region <- quarter_mile_summary %>%
+  left_join(state_regions, by = c("state" = "STATE"))
+
+region_summary <- quarter_mile_summary_region %>%
+  group_by(REGION) %>%
+  summarise(
+    schools_near_site = sum(unique_schools),
+    total_schools     = sum(total_schools),
+    prop_near_site    = schools_near_site / total_schools,
+    .groups           = "drop"
+  ) %>%
+  print()
+
+# Identify places with missing region
+quarter_mile_summary_region %>%
+  filter(is.na(REGION)) %>%
+  select(state, unique_schools, total_schools) %>%
+  print()
+
+print(fig3)
+
+```
+
+```{r}
+# =========================================
+# Figure 4: Pollution Site Density and Proximity to Schools by State
+# =========================================
+
+# =========================================
+# 1. Clean and Standardize State Info in Pollution Sites
+# =========================================
+
+all_pollution_sf_clean <- all_pollution_sf %>%
+  mutate(
+    state = coalesce(X8..ST, STATE, State),
+    state = toupper(trimws(state))
+  )
+
+# Identify invalid state codes
+invalid_states <- all_pollution_sf_clean %>%
+  filter(!state %in% c(state.abb, "DC", "PR")) %>%
+  distinct(state)
+
+if(nrow(invalid_states) == 0) {
+  message("No invalid state codes found. All states are valid.")
+} else {
+  message("Invalid state codes found:")
+  print(invalid_states)
+}
+
+# Keep only valid states + DC + PR
+valid_states <- c(state.abb, "DC", "PR")
+sites_in_states <- all_pollution_sf_clean %>%
+  filter(state %in% valid_states)
+
+# =========================================
+# 2. Prepare Population Data
+# =========================================
+
+data(statepop)
+
+statepop_clean <- statepop %>%
+  transmute(
+    state      = toupper(abbr),
+    population = pop_2022
+  )
+
+# =========================================
+# 3. Compute Total Sites per State and Per Capita Metrics
+# =========================================
+
+state_counts <- sites_in_states %>%
+  count(state, name = "site_count")
+
+if(nrow(state_counts) == 0) {
+  message("No states have pollution sites. Exiting early.")
+} else {
+  sites_per_capita <- state_counts %>%
+    left_join(statepop_clean, by = "state") %>%
+    mutate(
+      sites_per_100k = (site_count / population) * 100000
+    ) %>%
+    arrange(desc(sites_per_100k))
+
+  if(nrow(sites_per_capita) == 0) {
+    message("No states with population-adjusted site counts.")
+  } else {
+    message("Top 5 states by total sites per 100k:")
+    print(head(sites_per_capita, 5))
+  }
+}
+
+# =========================================
+# 4. Assign State Info to School-Site Pairs and Count Unique Sites
+# =========================================
+
+all_school_all_pairs_state <- all_school_all_pairs %>%
+  left_join(
+    all_pollution_sf_clean %>% st_drop_geometry() %>% select(SITE_ID, state),
+    by = "SITE_ID"
+  )
+
+state_unique_sites <- all_school_all_pairs_state %>%
+  filter(buffer_distance == "0.25mi") %>%
+  distinct(state, SITE_ID) %>%
+  count(state, name = "unique_sites_near_schools")
+
+if(nrow(state_unique_sites) == 0) {
+  message("No pollution sites within 0.25 mile of any school.")
+}
+
+state_unique_sites_pop <- state_unique_sites %>%
+  left_join(statepop_clean, by = "state") %>%
+  mutate(
+    sites_near_schools_per_100k = (unique_sites_near_schools / population) * 100000
+  )
+
+# =========================================
+# 5. Merge All Metrics and Compute Proportions
+# =========================================
+
+final_state_df <- sites_per_capita %>%
+  left_join(state_unique_sites_pop, by = "state") %>%
+  mutate(
+    prop_near_schools = sites_near_schools_per_100k / sites_per_100k
+  )
+
+# National average proportion for reference line
+avg_prop <- sum(final_state_df$sites_near_schools_per_100k, na.rm = TRUE) /
+            sum(final_state_df$sites_per_100k, na.rm = TRUE)
+
+message(sprintf("National average proportion of sites within 0.25 mi of schools: %.2f", avg_prop))
+
+# =========================================
+# 6. Add State Names and Density Data
+# Note: state_crosswalk already built in blood lead validation chunk
+# =========================================
+
+state_density <- read.csv("Data/Misc/state_density.csv")
+
+final_state_df <- final_state_df %>%
+  left_join(state_crosswalk, by = c("state" = "state_abbrev")) %>%
+  left_join(state_density, by = c("state_name" = "State")) %>%
+  mutate(Density = as.numeric(gsub(",", "", Density)))
+
+# =========================================
+# 7. Scatter Plot: Sites per 100k vs Sites Near Schools per 100k
+# =========================================
+
+if(nrow(final_state_df) == 0) {
+  message("No data available for plotting.")
+} else {
+
+  # Create discrete density bands for cleaner color legend
+  final_state_df <- final_state_df %>%
+    mutate(
+      density_band = case_when(
+        Density <   50 ~ "< 50",
+        Density <  200 ~ "50-200",
+        Density <  500 ~ "200-500",
+        Density < 1000 ~ "500-1,000",
+        TRUE           ~ "≥1,000"
+      ),
+      density_band = factor(density_band, levels = c("< 50", "50-200", "200-500", "500-1,000", "≥1,000"))
+    )
+
+fig4 <- 
+  ggplot(final_state_df, aes(
+    x     = sites_per_100k,
+    y     = sites_near_schools_per_100k,
+    label = state,
+    color = density_band
+  )) +
+    geom_point(size = 3) +
+    geom_text_repel(
+      size          = 3,
+      fontface      = "bold",
+      max.overlaps  = Inf,
+      box.padding   = 0.4,
+      point.padding = 0.3,
+      segment.color = "grey70",
+      segment.size  = 0.3
+    ) +
+    geom_abline(slope = avg_prop, intercept = 0, linetype = "dashed", color = "red") +
+    scale_color_manual(
+      values = c(
+        "< 50"      = "#9ecae1",
+        "50-200"    = "#6baed6",
+        "200-500"   = "#2171b5",
+        "500-1,000" = "#084594",
+        "≥1,000"    = "#08306b"
+      )
+    ) +
+    labs(
+      x        = "Total Pollution Sites per 100,000 People",
+      y        = "Sites Within 0.25 Mile of a School\nper 100,000 People",
+      color    = "Population Density\n(people per sq. mile)",
+      # title    = "Pollution Sites vs Proximity to Schools by State",
+      # subtitle = "Dashed red line = national average proportion of sites within 0.25 mile of schools"
+    ) +
+    theme_minimal() +
+    theme(
+      plot.title      = element_text(hjust = 0.5),
+      plot.subtitle   = element_text(hjust = 0.5),
+      legend.position = "right"
+    )
+}
+
+print(fig4)
+
+```
+
+```{r}
+# =========================================
+# State-Level Summary Table (requested by Grace, 4/21/26)
+# Combines Figure 4 state metrics with school urbanicity breakdown
+# Includes: population, area, total pollution sites, sites within 0.25mi
+# of a school, and % of schools in each urbanicity category by state
+# =========================================
+
+state_summary_table <- final_state_df %>% 
+  select(state, site_count, unique_sites_near_schools, population.x, Density)
+
+state_summary_table <- state_summary_table %>%
+  mutate(
+    area_sq_miles = population.x / Density
+  )
+
+state_summary_table <- state_summary_table %>%
+  transmute(
+    state,
+    population = population.x,
+    area_sq_miles,
+    total_pollution_sites = site_count,
+    sites_within_0.25mi_school = unique_sites_near_schools
+  ) %>%
+  arrange((state)) %>%
+  st_drop_geometry()
+
+# calculate percentage of schools by urbanicity in each state
+
+school_urban <- all_school_clean %>%
+  group_by(STATE, urbanicity) %>%
+  summarise(n = n(), .groups = "drop")
+
+school_urban_pct <- school_urban %>%
+  group_by(STATE) %>%
+  mutate(pct = round(n / sum(n), 2)) %>%
+  ungroup()
+
+school_urban_wide <- school_urban_pct %>%
+  select(STATE, urbanicity, pct) %>%
+  tidyr::pivot_wider(
+    names_from = urbanicity,
+    values_from = pct,
+    values_fill = 0
+  )
+
+state_summary_table <- state_summary_table %>%
+  left_join(school_urban_wide, by = c("state" = "STATE"))
+
+print(state_summary_table)
+
+write.csv(state_summary_table, "Data/Newly Built/state_summary_table.csv", row.names = FALSE)
+
+```
+
+```{r}
+# Wisconsin and Indiana site counts by type (requested by Grace, 5/11/26)
+all_pollution_sf_clean %>%
+  st_drop_geometry() %>%
+  filter(state %in% c("WI", "IN")) %>%
+  count(state, site_type, name = "total_sites")
+
+# Within 0.25mi of a school by site type for WI and IN
+bind_rows(
+  all_school_superfund_pairs,
+  all_school_brownfield_pairs,
+  all_school_tri_pairs
+) %>%
+  filter(buffer_distance == "0.25mi") %>%
+  left_join(
+    all_pollution_sf_clean %>% st_drop_geometry() %>% select(SITE_ID, state),
+    by = "SITE_ID"
+  ) %>%
+  filter(state %in% c("WI", "IN")) %>%
+  distinct(SITE_ID, state, site_type) %>%
+  count(state, site_type, name = "sites_within_025mi_schools")
+
+```
+
+```{r}
+# ============================================================
+# Table 1. Schools Near Environmental Hazard Sites
+# Counts and proportions of schools near all sites and high-risk sites
+# by school type (All, Public, Private) and buffer distance
+# ============================================================
+
+# --- All Sites ---
+table1_allsites <- bind_rows(
+  # All schools
+  all_all_summary$national %>%
+    mutate(school_type = "All",
+           prop_unique = round(unique_schools / n_all, 2)),
+
+  # Public schools
+  all_public_summary$national %>%
+    mutate(school_type = "Public",
+           prop_unique = round(unique_schools / n_public, 2)),
+
+  # Private schools
+  all_private_summary$national %>%
+    mutate(school_type = "Private",
+           prop_unique = round(unique_schools / n_private, 2))
+) %>%
+  select(school_type, buffer_distance, unique_schools, prop_unique) %>%
+  rename(schools_near_all = unique_schools, prop_near_all = prop_unique)
+
+# --- High-Risk Sites ---
+table1_highrisk <- bind_rows(
+  # All schools
+  school_level_all %>%
+    filter(any_highrisk == TRUE) %>%
+    mutate(school_type = "All",
+           prop_unique = round(n_schools / n_all, 2)) %>%
+    select(school_type, buffer_distance, n_schools, prop_unique),
+
+  # Public and Private schools
+  school_level_by_type %>%
+    filter(any_highrisk == TRUE) %>%
+    mutate(prop_unique = case_when(
+      school_type == "Public"  ~ round(n_schools / n_public,  2),
+      school_type == "Private" ~ round(n_schools / n_private, 2)
+    )) %>%
+    select(school_type, buffer_distance, n_schools, prop_unique)
+) %>%
+  rename(schools_near_hr = n_schools, prop_near_hr = prop_unique)
+
+# --- Combine into Table 1 ---
+table1 <- table1_allsites %>%
+  left_join(table1_highrisk, by = c("school_type", "buffer_distance")) %>%
+  mutate(school_type = factor(school_type, levels = c("All", "Public", "Private"))) %>%
+  arrange(school_type, buffer_distance)
+
+print(table1)
+
+```
+
+```{r}
+# ============================================================
+# Appendix Table A2. Student Enrollment and FTE Staff Counts
+# By school type and distance for all hazard sites
+# Values come from combined_all, combined_public, combined_private
+# Non-instructional staff estimated at 1.046x FTE teachers (see Appendix B1)
+# ============================================================
+
+table_a2 <- bind_rows(
+  combined_all %>%
+    filter(site_type == "All Pollution Sites",
+           buffer_distance != "All Schools"),
+
+  combined_public %>%
+    filter(site_type == "All Pollution Sites",
+           buffer_distance != "All Schools"),
+
+  combined_private %>%
+    filter(site_type == "All Pollution Sites",
+           buffer_distance != "All Schools")
+) %>%
+  mutate(
+    total_noninstr_staff = round(total_teachers * 1.046),
+    total_staff_students = total_enrollment + total_teachers + total_noninstr_staff,
+    school_type          = factor(school_type, levels = c("All Schools (Public and Private)", "Public", "Private"))
+  ) %>%
+  select(school_type, buffer_distance, total_enrollment, total_teachers,
+         total_noninstr_staff, total_staff_students) %>%
+  arrange(school_type, buffer_distance)
+
+print(table_a2)
+
+```
+
+```{r}
+# ============================================================
+# Appendix Table A3. Disparity Ratios by Race
+# Proximity to Known Environmental Hazard Sites
+# Values from exposure_ratios built in Step 8
+# ============================================================
+
+table_a3 <- bind_rows(
+  combined_public,
+  combined_private,
+  combined_all
+) %>%
+  filter(site_type == "All Pollution Sites") %>%
+  mutate(
+    Distance          = factor(buffer_distance, levels = c("0.125mi", "0.25mi", "0.5mi", "1mi")),
+    Black_vs_White    = round(prob_Black    / prob_White, 2),
+    Hispanic_vs_White = round(prob_Hispanic / prob_White, 2),
+    Native_vs_White   = round(prob_Native   / prob_White, 2),
+    Hawaiian_vs_White = round(prob_Hawaiian / prob_White, 2),
+    Asian_vs_White    = round(prob_Asian    / prob_White, 2),
+    school_type       = factor(school_type, levels = c("All Schools (Public and Private)", "Public", "Private"))
+  ) %>%
+  select(school_type, Distance, Black_vs_White, Hispanic_vs_White,
+         Native_vs_White, Hawaiian_vs_White, Asian_vs_White) %>%
+  filter(!is.na(Distance)) %>%
+  arrange(school_type, Distance)
+
+print(table_a3)
+
+```
+
+```{r}
+# ============================================================
+# Appendix Table A4. Public School Disparity Ratios by Program
+# Proximity to Known Environmental Hazard Sites
+# Public schools only — FRPL, EL, SWD data not available for private
+# Values from combined_public built in Step 8
+# ============================================================
+
+table_a4 <- combined_public %>%
+  filter(
+    site_type       == "All Pollution Sites",
+    school_type     == "Public",
+    !is.na(buffer_distance),
+    buffer_distance != "All Schools"
+  ) %>%
+  mutate(
+    Distance      = factor(buffer_distance, levels = c("0.125mi", "0.25mi", "0.5mi", "1mi")),
+    FRPL_vs_NonFRL = round(prob_FRL  / prob_NonFRL,  2),
+    EL_vs_NonEL   = round(prob_EL   / prob_NonEL,   2),
+    SWD_vs_NonSWD = round(prob_IDEA / prob_NonIDEA,  2)
+  ) %>%
+  select(Distance, FRPL_vs_NonFRL, EL_vs_NonEL, SWD_vs_NonSWD) %>%
+  arrange(Distance)
+
+print(table_a4)
+
+```
+
+```{r}
+# ============================================================
+# Appendix Table A5. Disparity Ratios by Race
+# Proximity to Higher-Risk Environmental Hazard Sites
+# Values from combined_public_hr, combined_private_hr, combined_all_hr
+# ============================================================
+
+table_a5 <- bind_rows(
+  combined_public_hr,
+  combined_private_hr,
+  combined_all_hr
+) %>%
+  filter(
+    site_type       == "All Pollution Sites",
+    !is.na(buffer_distance),
+    buffer_distance != "All Schools"
+  ) %>%
+  mutate(
+    Distance          = factor(buffer_distance, levels = c("0.125mi", "0.25mi", "0.5mi", "1mi")),
+    Black_vs_White    = round(prob_Black    / prob_White, 2),
+    Hispanic_vs_White = round(prob_Hispanic / prob_White, 2),
+    Native_vs_White   = round(prob_Native   / prob_White, 2),
+    Hawaiian_vs_White = round(prob_Hawaiian / prob_White, 2),
+    Asian_vs_White    = round(prob_Asian    / prob_White, 2),
+    school_type       = factor(school_type, levels = c("All Schools (Public and Private)", "Public", "Private"))
+  ) %>%
+  select(school_type, Distance, Black_vs_White, Hispanic_vs_White,
+         Native_vs_White, Hawaiian_vs_White, Asian_vs_White) %>%
+  arrange(school_type, Distance)
+
+print(table_a5)
+
+```
+
+```{r}
+# ============================================================
+# Appendix Table A6. Public School Disparity Ratios by Program
+# Proximity to Higher-Risk Environmental Hazard Sites
+# Public schools only — FRPL, EL, SWD data not available for private
+# Values from combined_public_hr built in high-risk section
+# ============================================================
+
+table_a6 <- combined_public_hr %>%
+  filter(
+    site_type       == "All Pollution Sites",
+    school_type     == "Public",
+    !is.na(buffer_distance),
+    buffer_distance != "All Schools"
+  ) %>%
+  mutate(
+    Distance       = factor(buffer_distance, levels = c("0.125mi", "0.25mi", "0.5mi", "1mi")),
+    FRPL_vs_NonFRL = round(prob_FRL  / prob_NonFRL,  2),
+    EL_vs_NonEL   = round(prob_EL   / prob_NonEL,   2),
+    SWD_vs_NonSWD = round(prob_IDEA / prob_NonIDEA,  2)
+  ) %>%
+  select(Distance, FRPL_vs_NonFRL, EL_vs_NonEL, SWD_vs_NonSWD) %>%
+  arrange(Distance)
+
+print(table_a6)
+
+```
+
+```{r}
+# ============================================================
+# Appendix Table A7. Proportion of Schools Near Any Pollution
+# Site by Distance and State, with State Rankings
+# ============================================================
+
+# --- 1. Build long summary across all distances ---
+all_distance_summary <- all_all_summary$state %>%
+  left_join(total_schools_state, by = "STATE") %>%
+  mutate(prop_near_site = round(unique_schools / total_schools, 4)) %>%
+  rename(state = STATE) %>%
+  select(state, buffer_distance, unique_schools, total_schools, prop_near_site) %>%
+  arrange(state, buffer_distance)
+
+# --- 2. Extended crosswalk to include non-state entities ---
+full_crosswalk <- bind_rows(
+  tibble(state_abbrev = state.abb, state_name = state.name),
+  tibble(
+    state_abbrev = c("DC", "PR", "VI", "MP", "BI"),
+    state_name   = c("District of Columbia", "Puerto Rico", "U.S. Virgin Islands",
+                     "Commonwealth of the Northern Mariana Islands", "Bureau of Indian Education")
+  )
+)
+
+# --- 3. Non-state rows excluded from ranking ---
+non_states <- c("District of Columbia", "Bureau of Indian Education",
+                "Commonwealth of the Northern Mariana Islands",
+                "Puerto Rico", "U.S. Virgin Islands")
+
+# --- 4. Pivot wide, join full state names, and add rankings ---
+# Non-states are set to NA before ranking so they don't consume rank positions
+# rank() with na.last = "keep" skips NAs and only ranks the 50 states
+all_distance_summary_wide_ranked <- all_distance_summary %>%
+  select(state, buffer_distance, prop_near_site) %>%
+  pivot_wider(
+    names_from  = buffer_distance,
+    values_from = prop_near_site
+  ) %>%
+  left_join(full_crosswalk, by = c("state" = "state_abbrev")) %>%
+  mutate(
+    state_name  = ifelse(is.na(state_name), state, state_name),
+    # Set non-state values to NA so they are excluded from ranking
+    rank_0125mi = ifelse(state_name %in% non_states, NA_real_, `0.125mi`),
+    rank_025mi  = ifelse(state_name %in% non_states, NA_real_, `0.25mi`),
+    rank_05mi   = ifelse(state_name %in% non_states, NA_real_, `0.5mi`),
+    rank_1mi    = ifelse(state_name %in% non_states, NA_real_, `1mi`),
+    # Rank among states only (1 = highest proportion)
+    rank_0125mi = ifelse(state_name %in% non_states, NA, rank(-rank_0125mi, ties.method = "min", na.last = "keep")),
+    rank_025mi  = ifelse(state_name %in% non_states, NA, rank(-rank_025mi,  ties.method = "min", na.last = "keep")),
+    rank_05mi   = ifelse(state_name %in% non_states, NA, rank(-rank_05mi,   ties.method = "min", na.last = "keep")),
+    rank_1mi    = ifelse(state_name %in% non_states, NA, rank(-rank_1mi,    ties.method = "min", na.last = "keep")),
+    # Combine prop and rank into one display column
+    `0.125mi_display` = ifelse(is.na(rank_0125mi), as.character(`0.125mi`), paste0(`0.125mi`, " (", rank_0125mi, ")")),
+    `0.25mi_display`  = ifelse(is.na(rank_025mi),  as.character(`0.25mi`),  paste0(`0.25mi`,  " (", rank_025mi,  ")")),
+    `0.5mi_display`   = ifelse(is.na(rank_05mi),   as.character(`0.5mi`),   paste0(`0.5mi`,   " (", rank_05mi,   ")")),
+    `1mi_display`     = ifelse(is.na(rank_1mi),    as.character(`1mi`),     paste0(`1mi`,     " (", rank_1mi,    ")"))
+  ) %>%
+  select(state_name, `0.125mi_display`, `0.25mi_display`, `0.5mi_display`, `1mi_display`) %>%
+  arrange(state_name)
+
+print(all_distance_summary_wide_ranked)
+write.csv(all_distance_summary_wide_ranked, "Data/Newly Built/table_a7_ranked.csv", row.names = FALSE)
+
+```
+
+```{r}
+# ============================================================
+# Appendix Table A8. Sites per 100,000 Residents by State
+# ============================================================
+
+sites_per_capita %>%
+  left_join(state_crosswalk, by = c("state" = "state_abbrev")) %>%
+  mutate(
+    state_name     = ifelse(is.na(state_name), state, state_name),
+    sites_per_100k = round(sites_per_100k, 1)
+  ) %>%
+  select(state_name, site_count, population, sites_per_100k) %>%
+  arrange(state_name) %>%
+  print()
+
+```
+
+```{r}
+# ============================================================
+# Appendix Tables A9 and A10
+# Site-centered proximity summaries with urbanicity breakdown
+# A9: All sites | A10: High-risk sites only
+# ============================================================
+
+# ============================================================
+# APPENDIX TABLE A9
+# Proportion of Known Environmental Hazard Sites within
+# Indicated Distance of at Least One School, with Urbanicity Breakdown
+# ============================================================
+
+# --- 1. Summarize site-centered proximity (Prop. All) ---
+summarize_sites_from_pairs <- function(pairs_df, sites_sf) {
+  pairs_df %>%
+    group_by(buffer_distance) %>%
+    summarise(
+      unique_sites_with_schools = n_distinct(SITE_ID),
+      total_intersections       = n(),
+      .groups                   = "drop"
+    ) %>%
+    mutate(
+      prop_sites  = round(unique_sites_with_schools / nrow(sites_sf), 3),
+      total_sites = nrow(sites_sf)
+    )
+}
+
+tri_site_summary        <- summarize_sites_from_pairs(all_school_tri_pairs,        tri_sf)
+superfund_site_summary  <- summarize_sites_from_pairs(all_school_superfund_pairs,  superfund_sf)
+brownfield_site_summary <- summarize_sites_from_pairs(all_school_brownfield_pairs, brownfield_sf)
+all_site_summary        <- summarize_sites_from_pairs(all_school_all_pairs,        all_pollution_sf)
+
+combined_national_sites <- bind_rows(
+  superfund_site_summary  %>% mutate(dataset = "Superfund"),
+  brownfield_site_summary %>% mutate(dataset = "Brownfield"),
+  tri_site_summary        %>% mutate(dataset = "TRI"),
+  all_site_summary        %>% mutate(dataset = "All Pollution Sites")
+) %>%
+  select(dataset, buffer_distance, unique_sites_with_schools, total_sites, prop_sites)
+
+# --- 2. Join urbanicity breakdown from site_urbanicity_summary_wide ---
+table_a9_full <- combined_national_sites %>%
+  left_join(
+    site_urbanicity_summary_wide %>%
+      select(dataset, buffer_distance, city, suburban, town, rural),
+    by = c("dataset", "buffer_distance")
+  ) %>%
+  arrange(dataset, buffer_distance)
+
+print(table_a9_full)
+write.csv(table_a9_full, "Data/Newly Built/table_a9_full.csv", row.names = FALSE)
+
+# ============================================================
+# APPENDIX TABLE A10 (HIGH-RISK VERSION)
+# Replicates A9 logic but filtered to high-risk sites only
+# ============================================================
+
+# --- 1. Filter pair datasets to high-risk sites only ---
+hr_superfund_pairs <- all_school_superfund_pairs %>%
+  left_join(superfund_highrisk_sf %>% st_drop_geometry() %>% select(SITE_ID, HighRisk_flag),
+            by = "SITE_ID") %>%
+  filter(HighRisk_flag == TRUE)
+
+hr_brownfield_pairs <- all_school_brownfield_pairs %>%
+  left_join(brownfield_highrisk_sf %>% st_drop_geometry() %>% select(SITE_ID, HighRisk_flag),
+            by = "SITE_ID") %>%
+  filter(HighRisk_flag == TRUE)
+
+hr_tri_pairs <- all_school_tri_pairs %>%
+  left_join(tri_highrisk_sf %>% st_drop_geometry() %>% select(SITE_ID, HighRisk_flag),
+            by = "SITE_ID") %>%
+  filter(HighRisk_flag == TRUE)
+
+hr_all_pairs <- all_school_all_pairs %>%
+  left_join(all_pollution_highrisk_sf %>% st_drop_geometry() %>% select(SITE_ID, HighRisk_flag),
+            by = "SITE_ID") %>%
+  filter(HighRisk_flag == TRUE)
+
+# --- 2. Total high-risk sites by type (denominators for Prop. All) ---
+total_hr_superfund  <- superfund_highrisk_sf  %>% filter(HighRisk_flag == TRUE) %>% nrow()
+total_hr_brownfield <- brownfield_highrisk_sf %>% filter(HighRisk_flag == TRUE) %>% nrow()
+total_hr_tri        <- tri_highrisk_sf        %>% filter(HighRisk_flag == TRUE) %>% nrow()
+total_hr_all        <- all_pollution_highrisk_sf %>% filter(HighRisk_flag == TRUE) %>% nrow()
+
+# --- 3. Overall counts and props ---
+hr_overall_summary <- bind_rows(
+  hr_superfund_pairs  %>% group_by(buffer_distance) %>% summarise(sites_near_schools = n_distinct(SITE_ID), .groups = "drop") %>% mutate(dataset = "Superfund",          total_sites = total_hr_superfund),
+  hr_brownfield_pairs %>% group_by(buffer_distance) %>% summarise(sites_near_schools = n_distinct(SITE_ID), .groups = "drop") %>% mutate(dataset = "Brownfield",         total_sites = total_hr_brownfield),
+  hr_tri_pairs        %>% group_by(buffer_distance) %>% summarise(sites_near_schools = n_distinct(SITE_ID), .groups = "drop") %>% mutate(dataset = "TRI",                 total_sites = total_hr_tri),
+  hr_all_pairs        %>% group_by(buffer_distance) %>% summarise(sites_near_schools = n_distinct(SITE_ID), .groups = "drop") %>% mutate(dataset = "All Pollution Sites", total_sites = total_hr_all)
+) %>%
+  mutate(prop_all = round(sites_near_schools / total_sites, 3)) %>%
+  select(dataset, buffer_distance, sites_near_schools, total_sites, prop_all)
+
+# --- 4. Attach urbanicity to high-risk pair datasets ---
+hr_superfund_urb  <- hr_superfund_pairs  %>% left_join(sites_with_locale_superfund  %>% st_drop_geometry(), by = "SITE_ID")
+hr_brownfield_urb <- hr_brownfield_pairs %>% left_join(sites_with_locale_brownfield %>% st_drop_geometry(), by = "SITE_ID")
+hr_tri_urb        <- hr_tri_pairs        %>% left_join(sites_with_locale_tri        %>% st_drop_geometry(), by = "SITE_ID")
+hr_all_urb        <- hr_all_pairs        %>% left_join(sites_with_locale_all        %>% st_drop_geometry(), by = "SITE_ID")
+
+# --- 5. Urbanicity denominators for high-risk sites ---
+hr_denom_superfund <- superfund_highrisk_sf %>% st_drop_geometry() %>%
+  filter(HighRisk_flag == TRUE) %>%
+  left_join(sites_with_locale_superfund %>% st_drop_geometry(), by = "SITE_ID") %>%
+  count(site_urbanicity, name = "total_sites")
+
+hr_denom_brownfield <- brownfield_highrisk_sf %>% st_drop_geometry() %>%
+  filter(HighRisk_flag == TRUE) %>%
+  left_join(sites_with_locale_brownfield %>% st_drop_geometry(), by = "SITE_ID") %>%
+  count(site_urbanicity, name = "total_sites")
+
+hr_denom_tri <- tri_highrisk_sf %>% st_drop_geometry() %>%
+  filter(HighRisk_flag == TRUE) %>%
+  left_join(sites_with_locale_tri %>% st_drop_geometry(), by = "SITE_ID") %>%
+  count(site_urbanicity, name = "total_sites")
+
+hr_denom_all <- all_pollution_highrisk_sf %>% st_drop_geometry() %>%
+  filter(HighRisk_flag == TRUE) %>%
+  left_join(sites_with_locale_all %>% st_drop_geometry(), by = "SITE_ID") %>%
+  count(site_urbanicity, name = "total_sites")
+
+# --- 6. Urbanicity summary ---
+distances  <- c("0.125mi", "0.25mi", "0.5mi", "1mi")
+hr_results <- list()
+
+for (dist in distances) {
+  hr_results[[paste0("Superfund_",           dist)]] <- hr_superfund_urb  %>% filter(buffer_distance == dist) %>% distinct(SITE_ID, site_urbanicity) %>% count(site_urbanicity, name = "sites_near_schools") %>% left_join(hr_denom_superfund,  by = "site_urbanicity") %>% mutate(dataset = "Superfund",          buffer_distance = dist, prop_near = round(sites_near_schools / total_sites, 3))
+  hr_results[[paste0("Brownfield_",          dist)]] <- hr_brownfield_urb %>% filter(buffer_distance == dist) %>% distinct(SITE_ID, site_urbanicity) %>% count(site_urbanicity, name = "sites_near_schools") %>% left_join(hr_denom_brownfield, by = "site_urbanicity") %>% mutate(dataset = "Brownfield",         buffer_distance = dist, prop_near = round(sites_near_schools / total_sites, 3))
+  hr_results[[paste0("TRI_",                 dist)]] <- hr_tri_urb        %>% filter(buffer_distance == dist) %>% distinct(SITE_ID, site_urbanicity) %>% count(site_urbanicity, name = "sites_near_schools") %>% left_join(hr_denom_tri,        by = "site_urbanicity") %>% mutate(dataset = "TRI",                buffer_distance = dist, prop_near = round(sites_near_schools / total_sites, 3))
+  hr_results[[paste0("All Pollution Sites_", dist)]] <- hr_all_urb        %>% filter(buffer_distance == dist) %>% distinct(SITE_ID, site_urbanicity) %>% count(site_urbanicity, name = "sites_near_schools") %>% left_join(hr_denom_all,        by = "site_urbanicity") %>% mutate(dataset = "All Pollution Sites", buffer_distance = dist, prop_near = round(sites_near_schools / total_sites, 3))
+}
+
+# --- 7. Pivot wide ---
+hr_urbanicity_wide <- bind_rows(hr_results) %>%
+  select(dataset, buffer_distance, site_urbanicity, prop_near) %>%
+  pivot_wider(names_from = site_urbanicity, values_from = prop_near) %>%
+  select(dataset, buffer_distance, city, suburban, town, rural, `NA`) %>%
+  arrange(dataset, buffer_distance)
+
+# --- 8. Join overall and urbanicity into final table ---
+table_a10_full <- hr_overall_summary %>%
+  left_join(
+    hr_urbanicity_wide %>%
+      select(dataset, buffer_distance, city, suburban, town, rural),
+    by = c("dataset", "buffer_distance")
+  ) %>%
+  arrange(dataset, buffer_distance)
+
+print(table_a10_full)
+write.csv(table_a10_full, "Data/Newly Built/table_a10_full.csv", row.names = FALSE)
+
+# --- Check sites with missing urbanicity for high-risk sites ---
+bind_rows(
+  hr_denom_superfund  %>% mutate(site_type = "Superfund"),
+  hr_denom_brownfield %>% mutate(site_type = "Brownfield"),
+  hr_denom_tri        %>% mutate(site_type = "TRI"),
+  hr_denom_all        %>% mutate(site_type = "All Pollution Sites")
+) %>%
+  group_by(site_type) %>%
+  summarise(
+    total       = sum(total_sites),
+    missing     = sum(total_sites[is.na(site_urbanicity)]),
+    pct_missing = round(missing / total * 100, 1),
+    .groups     = "drop"
+  ) %>%
+  print()
+
+```
+
+```{r}
+# ============================================================
+# Appendix Table A11. School Proximity to All and High-Risk
+# Environmental Hazard Sites, by Site Type, Distance, and School Type
+# Reports counts and proportions of schools near any pollution site
+# and near high-risk sites only, across all site types and distances
+# for all schools (public and private combined)
+# ============================================================
+
+# --- Helper to build all-sites summary ---
+make_allsites_summary <- function(tri_summary, superfund_summary, brownfield_summary, all_summary, n_denom, school_type_label) {
+  bind_rows(
+    tri_summary$national        %>% mutate(source = "TRI"),
+    superfund_summary$national  %>% mutate(source = "Superfund"),
+    brownfield_summary$national %>% mutate(source = "Brownfield"),
+    all_summary$national        %>% mutate(source = "All Pollution Sites")
+  ) %>%
+    select(source, buffer_distance, unique_schools, total_intersections) %>%
+    mutate(
+      prop_unique   = round(unique_schools / n_denom, 2),
+      school_type   = school_type_label,
+      risk_category = "All Sites"
+    )
+}
+
+# --- Helper to build high-risk summary ---
+make_highrisk_summary <- function(school_level_tri, school_level_superfund, school_level_brownfield, school_level_all, school_type_label) {
+  bind_rows(
+    school_level_tri        %>% mutate(source = "TRI"),
+    school_level_superfund  %>% mutate(source = "Superfund"),
+    school_level_brownfield %>% mutate(source = "Brownfield"),
+    school_level_all        %>% mutate(source = "All Pollution Sites")
+  ) %>%
+    filter(any_highrisk == TRUE) %>%
+    select(source, buffer_distance, unique_schools = n_schools, prop_unique = prop_schools) %>%
+    mutate(
+      total_intersections = NA_integer_,
+      school_type         = school_type_label,
+      risk_category       = "High-Risk Sites"
+    )
+}
+
+# --- Build summaries for all schools ---
+allsites_all  <- make_allsites_summary(tri_all_summary, superfund_all_summary, brownfield_all_summary, all_all_summary, n_all, "All")
+highrisk_all  <- make_highrisk_summary(school_level_tri, school_level_superfund, school_level_brownfield, school_level_all, "All")
+
+# --- Combine and export ---
+combined_final <- bind_rows(allsites_all, highrisk_all) %>%
+  select(school_type, risk_category, source, buffer_distance, unique_schools, prop_unique) %>%
+  arrange(school_type, risk_category, source, buffer_distance)
+
+print(combined_final)
+write.csv(combined_final, "Data/Newly Built/national_school_pollution_exposure_allsites_highrisk.csv", row.names = FALSE)
+
+```
+
+```{r}
+# ============================================================
+# Appendix Table A12. Disparity Ratios by Race and Program
+# Across All Site Types and Distances, for All and High-Risk Sites
+# All schools (public and private combined)
+# Extends A3/A5 by breaking out ratios by individual site type
+# (Superfund, Brownfield, TRI, All Pollution Sites)
+# ============================================================
+
+compute_ratios <- function(df) {
+  df %>%
+    mutate(
+      Distance          = factor(buffer_distance, levels = c("0.125mi", "0.25mi", "0.5mi", "1mi")),
+      FRL_vs_NonFRL     = ifelse(school_type == "Public", round(prob_FRL     / prob_NonFRL,  2), NA),
+      IDEA_vs_NonIDEA   = ifelse(school_type == "Public", round(prob_IDEA    / prob_NonIDEA, 2), NA),
+      EL_vs_NonEL       = ifelse(school_type == "Public", round(prob_EL      / prob_NonEL,   2), NA),
+      Black_vs_White    = round(prob_Black    / prob_White, 2),
+      Hispanic_vs_White = round(prob_Hispanic / prob_White, 2),
+      Native_vs_White   = round(prob_Native   / prob_White, 2),
+      Hawaiian_vs_White = round(prob_Hawaiian / prob_White, 2),
+      Asian_vs_White    = round(prob_Asian    / prob_White, 2)
+    ) %>%
+    pivot_longer(
+      cols = c(FRL_vs_NonFRL, IDEA_vs_NonIDEA, EL_vs_NonEL,
+               Black_vs_White, Hispanic_vs_White, Native_vs_White,
+               Hawaiian_vs_White, Asian_vs_White),
+      names_to  = "Comparison",
+      values_to = "Prob_Ratio"
+    ) %>%
+    select(school_type, site_type, Distance, Comparison, Prob_Ratio) %>%
+    arrange(school_type, site_type, Distance, Comparison)
+}
+
+# --- Compute ratios for all schools combined, both risk categories ---
+exposure_ratios    <- combined_all    %>% compute_ratios()
+exposure_ratios_hr <- combined_all_hr %>% compute_ratios()
+
+# --- Combine and export ---
+exposure_ratios_combined <- bind_rows(
+  exposure_ratios    %>% mutate(risk_category = "All Sites"),
+  exposure_ratios_hr %>% mutate(risk_category = "High-Risk Sites")
+) %>%
+  select(school_type, risk_category, site_type, Distance, Comparison, Prob_Ratio) %>%
+  arrange(school_type, risk_category, site_type, Distance, Comparison)
+
+print(exposure_ratios_combined)
+write.csv(exposure_ratios_combined, "Data/Newly Built/national_school_pollution_exposure_ratios_allsites_highrisk.csv", row.names = FALSE)
+
+```
+
+```{r}
+# ============================================================
+# Appendix Table A13. Counts of Known Environmental Hazard Sites
+# Total and higher-risk site counts by site type
+# ============================================================
+
+tibble(
+  site_type   = c("Superfund", "Brownfield", "TRI", "All Pollution Sites"),
+  all_sites   = c(nrow(superfund_sf), nrow(brownfield_sf), nrow(tri_sf), nrow(all_pollution_sf)),
+  higher_risk = c(
+    superfund_highrisk_sf  %>% filter(HighRisk_flag == TRUE) %>% nrow(),
+    brownfield_highrisk_sf %>% filter(HighRisk_flag == TRUE) %>% nrow(),
+    tri_highrisk_sf        %>% filter(HighRisk_flag == TRUE) %>% nrow(),
+    all_pollution_highrisk_sf %>% filter(HighRisk_flag == TRUE) %>% nrow()
+  )
+) %>% print()
+
+```
+
+```{r}
+# ============================================================
+# Export All Figures to PDF
+# ============================================================
+
+pdf("Figures/Figure_1.pdf", width = 10, height = 7)
+print(fig1)
+dev.off()
+
+pdf("Figures/Figure_2.pdf", width = 10, height = 7)
+print(fig2a)
+dev.off()
+
+pdf("Figures/Figure_3.pdf", width = 10, height = 7)
+print(fig3)
+dev.off()
+
+pdf("Figures/Figure_4.pdf", width = 10, height = 7)
+print(fig4)
+dev.off()
+
+pdf("Figures/Appendix_Figure_1.pdf", width = 10, height = 7)
+print(fig2b)
+dev.off()
+
+```
+

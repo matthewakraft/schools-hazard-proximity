@@ -1,0 +1,502 @@
+---
+title: "Data Cleaning Steps (Schools and Brownfields)"
+author: "Sohil Malik"
+date: "2025-10-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+```
+
+```{r}
+# -------------------------------
+# Public School Data Cleaning 
+# -------------------------------
+
+# Load public school CSV
+public_school_2324 <- read.csv(
+  "Data/Schools/Public/ELSI_csv_export_6390341940620748533721/ELSI_csv_export_6390341940620748533721.csv",
+  skip = 6,
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+
+# Specify numeric and character columns
+cols_to_numeric <- c(
+  "Total.Students.All.Grades..Includes.AE...Public.School..2023.24",
+  "Free.and.Reduced.Lunch.Students..Public.School..2023.24",
+  "Black.or.African.American.Students..Public.School..2023.24",
+  "Hispanic.Students..Public.School..2023.24",
+  "American.Indian.Alaska.Native.Students..Public.School..2023.24",
+  "Nat..Hawaiian.or.Other.Pacific.Isl..Students..Public.School..2023.24",
+  "Asian.or.Asian.Pacific.Islander.Students..Public.School..2023.24",
+  "White.Students..Public.School..2023.24",
+  "Full.Time.Equivalent..FTE..Teachers..Public.School..2023.24"
+)
+
+cols_to_character <- c(
+  "School.ID..12.digit....NCES.Assigned..Public.School..Latest.available.year",
+  "Agency.ID...NCES.Assigned..Public.School..Latest.available.year"
+)
+
+# Convert column types
+public_school_2324[cols_to_character] <- 
+  lapply(public_school_2324[cols_to_character], as.character)
+
+public_school_2324[cols_to_numeric] <- 
+  lapply(public_school_2324[cols_to_numeric], function(x) suppressWarnings(as.numeric(x)))
+
+# Rename columns and trim whitespace
+new_public_names <- c(
+  School_Name = "School.Name",
+  State_Name_Latest = "State.Name..Public.School..Latest.available.year",
+  State_Name_2023_24 = "State.Name..Public.School..2023.24",
+  STATE = "State.Abbr..Public.School..Latest.available.year",
+  School_Name_2023_24 = "School.Name..Public.School..2023.24",
+  School_ID = "School.ID..12.digit....NCES.Assigned..Public.School..Latest.available.year",
+  Agency_ID = "Agency.ID...NCES.Assigned..Public.School..Latest.available.year",
+  County_Name_2023_24 = "County.Name..Public.School..2023.24",
+  FIPS_State_Code = "ANSI.FIPS.State.Code..Public.School..Latest.available.year",
+  Locale = "Locale..Public.School..2023.24",
+  Latitude = "Latitude..Public.School..2023.24",
+  Longitude = "Longitude..Public.School..2023.24",
+  Virtual_School_Status_2023_24 = "Virtual.School.Status..SY.2016.17.onward...Public.School..2023.24",
+  Total_Students_Public_2023_24 = "Total.Students.All.Grades..Includes.AE...Public.School..2023.24",
+  FRL_Students_Public_2023_24 = "Free.and.Reduced.Lunch.Students..Public.School..2023.24",
+  Black_Students_Public_2023_24 = "Black.or.African.American.Students..Public.School..2023.24",
+  Hispanic_Students_Public_2023_24 = "Hispanic.Students..Public.School..2023.24",
+  Native_Students_Public_2023_24 = "American.Indian.Alaska.Native.Students..Public.School..2023.24",
+  Hawaiian_Students_Public_2023_24 = "Nat..Hawaiian.or.Other.Pacific.Isl..Students..Public.School..2023.24",
+  Asian_Students_Public_2023_24 = "Asian.or.Asian.Pacific.Islander.Students..Public.School..2023.24",
+  White_Students_Public_2023_24 = "White.Students..Public.School..2023.24",
+  FTE_Teachers_Public_2023_24 = "Full.Time.Equivalent..FTE..Teachers..Public.School..2023.24"
+)
+
+public_school_2324 <- public_school_2324 %>% rename(!!!new_public_names)
+
+public_school_2324 <- public_school_2324 %>%
+  mutate(
+    STATE = str_trim(STATE),
+    State_Name_Latest = str_trim(State_Name_Latest),
+    State_Name_2023_24 = str_trim(State_Name_2023_24)
+  )
+
+# Standardize IDs and compute demographic proportions
+public_school_2324 <- public_school_2324 %>%
+  mutate(
+    School_ID = str_pad(as.character(School_ID), width = 12, side = "left", pad = "0"),
+
+    prop_frl = if_else(
+      !is.na(FRL_Students_Public_2023_24) &
+      !is.na(Total_Students_Public_2023_24) &
+      Total_Students_Public_2023_24 > 0,
+      pmin(100, 100 * FRL_Students_Public_2023_24 / Total_Students_Public_2023_24),
+      NA_real_
+    ),
+
+    prop_black = if_else(
+      !is.na(Black_Students_Public_2023_24) &
+      !is.na(Total_Students_Public_2023_24) &
+      Total_Students_Public_2023_24 > 0,
+      pmin(100, 100 * Black_Students_Public_2023_24 / Total_Students_Public_2023_24),
+      NA_real_
+    ),
+
+    prop_hispanic = if_else(
+      !is.na(Hispanic_Students_Public_2023_24) &
+      !is.na(Total_Students_Public_2023_24) &
+      Total_Students_Public_2023_24 > 0,
+      pmin(100, 100 * Hispanic_Students_Public_2023_24 / Total_Students_Public_2023_24),
+      NA_real_
+    ),
+    
+    prop_native = if_else(
+      !is.na(Native_Students_Public_2023_24) &
+      !is.na(Total_Students_Public_2023_24) &
+      Total_Students_Public_2023_24 > 0,
+      pmin(100, 100 * Native_Students_Public_2023_24 / Total_Students_Public_2023_24),
+      NA_real_
+    ),
+    
+    prop_hawaiian = if_else(
+      !is.na(Hawaiian_Students_Public_2023_24) &
+      !is.na(Total_Students_Public_2023_24) &
+      Total_Students_Public_2023_24 > 0,
+      pmin(100, 100 * Hawaiian_Students_Public_2023_24 / Total_Students_Public_2023_24),
+      NA_real_
+    ),
+    
+    prop_asian = if_else(
+      !is.na(Asian_Students_Public_2023_24) &
+      !is.na(Total_Students_Public_2023_24) &
+      Total_Students_Public_2023_24 > 0,
+      pmin(100, 100 * Asian_Students_Public_2023_24 / Total_Students_Public_2023_24),
+      NA_real_
+    ),
+
+    prop_white = if_else(
+      !is.na(White_Students_Public_2023_24) &
+      !is.na(Total_Students_Public_2023_24) &
+      Total_Students_Public_2023_24 > 0,
+      pmin(100, 100 * White_Students_Public_2023_24 / Total_Students_Public_2023_24),
+      NA_real_
+    )
+  )
+
+# Inspect counts before filtering
+total_schools <- nrow(public_school_2324)
+
+schools_le1 <- public_school_2324 %>%
+  filter(is.na(Total_Students_Public_2023_24) | Total_Students_Public_2023_24 <= 1) %>%
+  nrow()
+
+schools_fullvirtual <- public_school_2324 %>%
+  filter(!is.na(Virtual_School_Status_2023_24) &
+           str_to_lower(str_trim(Virtual_School_Status_2023_24)) == "fullvirtual") %>%
+  nrow()
+
+schools_both <- public_school_2324 %>%
+  filter(
+    (is.na(Total_Students_Public_2023_24) | Total_Students_Public_2023_24 <= 1) &
+      !is.na(Virtual_School_Status_2023_24) &
+      str_to_lower(str_trim(Virtual_School_Status_2023_24)) == "fullvirtual"
+  ) %>% nrow()
+
+cat("Total schools:", total_schools, "\n")
+cat("Schools with <=1 student:", schools_le1, "\n")
+cat("Schools FULLVIRTUAL:", schools_fullvirtual, "\n")
+cat("Schools with both <=1 student AND FULLVIRTUAL:", schools_both, "\n")
+
+# Filter: remove <=1 student and full virtual schools
+public_school_2324 <- public_school_2324 %>%
+  filter(
+    !is.na(Total_Students_Public_2023_24) &
+    Total_Students_Public_2023_24 > 1
+  ) %>%
+  filter(
+    is.na(Virtual_School_Status_2023_24) |
+    str_to_lower(str_trim(Virtual_School_Status_2023_24)) != "fullvirtual"
+  )
+
+cat("Schools after filtering:", nrow(public_school_2324), "\n")
+
+# Create urbanicity variable
+public_school_2324 <- public_school_2324 %>%
+  mutate(
+    urbanicity = case_when(
+      substr(Locale, 1, 2) %in% c("11","12","13") ~ "city",
+      substr(Locale, 1, 2) %in% c("21","22","23") ~ "suburban",
+      substr(Locale, 1, 2) %in% c("31","32","33") ~ "town",
+      substr(Locale, 1, 2) %in% c("41","42","43") ~ "rural",
+      TRUE ~ NA_character_
+    )
+  )
+
+cat("Schools without urbanicity:", sum(is.na(public_school_2324$urbanicity)), "\n")
+
+# Load CRDC 2021–22 and merge
+
+# school support
+public_school_crdc_support_2122 <- read.csv(
+  "Data/Schools/Public/2021-22-crdc-data/SCH/School Support.csv",
+  stringsAsFactors = FALSE
+) %>%
+  mutate(COMBOKEY = str_pad(as.character(COMBOKEY), width = 12, side = "left", pad = "0"))
+
+# Helper to sum valid CRDC counts per row
+sum_valid_crdc <- function(df, cols) {
+  # Convert selected columns to numeric and replace negatives with NA
+  mat <- as.matrix(df[cols])
+  mat <- apply(mat, 2, function(x) { x <- as.numeric(x); x[x < 0] <- NA; x })
+  
+  # Row-wise sum, NA if all components invalid
+  total <- rowSums(mat, na.rm = TRUE)
+  total[rowSums(!is.na(mat)) == 0] <- NA
+  total
+}
+
+# enrollment data (Disability and English Learners)
+public_school_crdc_enrollment_2122 <- read.csv(
+  "Data/Schools/Public/2021-22-crdc-data/SCH/Enrollment.csv",
+  stringsAsFactors = FALSE
+) %>%
+  mutate(
+    COMBOKEY = str_pad(as.character(COMBOKEY), width = 12, side = "left", pad = "0"),
+    SCH_ENR_IDEA_TOTAL = sum_valid_crdc(., c("SCH_ENR_IDEA_F", "SCH_ENR_IDEA_M", "SCH_ENR_IDEA_X")),
+    SCH_ENR_EL_TOTAL   = sum_valid_crdc(., c("SCH_ENR_EL_F", "SCH_ENR_EL_M", "SCH_ENR_EL_X"))
+  ) %>%
+  select(COMBOKEY, SCH_ENR_IDEA_F, SCH_ENR_IDEA_M, SCH_ENR_IDEA_X, SCH_ENR_IDEA_TOTAL,
+         SCH_ENR_EL_F, SCH_ENR_EL_M, SCH_ENR_EL_X, SCH_ENR_EL_TOTAL)
+
+public_school_combined <- public_school_2324 %>%
+  left_join(public_school_crdc_support_2122, by = c("School_ID" = "COMBOKEY"))
+
+public_school_combined <- public_school_combined %>%
+  left_join(public_school_crdc_enrollment_2122, by = c("School_ID" = "COMBOKEY"))
+
+```
+
+```{r}
+# -------------------------------
+# Private School Data Cleaning 
+# -------------------------------
+
+# Read Geo dataset (2023-24)
+private_school_geo <- read.csv(
+  "Data/Schools/Private/EDGE_GEOCODE_PRIVATESCH_2324/EDGE_GEOCODE_PRIVATESCH_2324.csv",
+  colClasses = c("PPIN" = "character")
+) %>%
+  mutate(
+    PPIN = str_pad(as.character(PPIN), width = 8, side = "left", pad = "0"),
+    LAT = as.numeric(LAT),
+    LON = as.numeric(LON),
+    LOCALE = as.character(LOCALE)  # ensure character for merging
+  )
+
+# Read Characteristics dataset (2019-20)
+private_school_char <- read.csv(
+  "Data/Schools/Private/ELSI_csv_export_6390347040389142352423/ELSI_csv_export_6390347040389142352423.csv",
+  skip = 6,
+  header = TRUE,
+  stringsAsFactors = FALSE
+)
+
+# Convert numeric columns and PPIN
+numeric_cols <- c(
+  "Total.Students..Ungraded...PK.12...Private.School..2019.20",
+  "Black.or.African.American.Students..Private.School..2019.20",
+  "Percentage.of.Black.Students..Private.School..2019.20",
+  "Hispanic.Students..Private.School..2019.20",
+  "Percentage.of.Hispanic.Students..Private.School..2019.20",
+  "American.Indian.Alaska.Native.Students..Private.School..2019.20",
+  "Percentage.of.American.Indian.Alaska.Native.Students..Private.School..2019.20",
+  "Nat..Hawaiian.or.Other.Pacific.Isl..Students..Private.School..2019.20",
+  "Percentage.of.Nat..Hawaiian.or.Other.Pacific.Isl..Students..Private.School..2019.20",
+  "Asian.or.Asian.Pacific.Islander.Students..Private.School..2019.20",
+  "Percentage.of.Asian.or.Asian.Pacific.Islander.Students..Private.School..2019.20",
+  "White.Students..Private.School..2019.20",
+  "Percentage.of.White.Students..Private.School..2019.20",
+  "Full.Time.Equivalent..FTE..Teachers..Private.School..2019.20"
+)
+
+id_col <- "School.ID...NCES.Assigned..Private.School..Latest.available.year"
+
+private_school_char[numeric_cols] <- lapply(private_school_char[numeric_cols], function(x) suppressWarnings(as.numeric(x)))
+private_school_char[[id_col]] <- as.character(private_school_char[[id_col]])
+
+# Rename columns to readable names
+new_private_names <- c(
+  Private_School_Name = "Private.School.Name",
+  State_Name_Latest = "State.Name..Private.School..Latest.available.year",
+  State_Name_2019_20 = "State.Name..Private.School..2019.20",
+  # FIPS_State_Code = "ANSI.FIPS.State.Code..Private.School..Latest.available.year",
+  STATE_not_geo_file = "State.Abbr..Private.School..Latest.available.year", 
+  Private_School_Name_2019_20 = "Private.School.Name..Private.School..2019.20",
+  PPIN = "School.ID...NCES.Assigned..Private.School..Latest.available.year",
+  Total_Students_Private_2019_20 = "Total.Students..Ungraded...PK.12...Private.School..2019.20",
+  Black_Students_Private_2019_20 = "Black.or.African.American.Students..Private.School..2019.20",
+  Hispanic_Students_Private_2019_20 = "Hispanic.Students..Private.School..2019.20",
+  Native_Students_Private_2019_20 = "American.Indian.Alaska.Native.Students..Private.School..2019.20",
+  Hawaiian_Students_Private_2019_20 = "Nat..Hawaiian.or.Other.Pacific.Isl..Students..Private.School..2019.20",
+  Asian_Students_Private_2019_20 = "Asian.or.Asian.Pacific.Islander.Students..Private.School..2019.20",
+  White_Students_Private_2019_20 = "White.Students..Private.School..2019.20",
+  prop_black = "Percentage.of.Black.Students..Private.School..2019.20",
+  prop_hispanic = "Percentage.of.Hispanic.Students..Private.School..2019.20",
+  prop_native = "Percentage.of.American.Indian.Alaska.Native.Students..Private.School..2019.20",
+  prop_hawaiian = "Percentage.of.Nat..Hawaiian.or.Other.Pacific.Isl..Students..Private.School..2019.20",
+  prop_asian = "Percentage.of.Asian.or.Asian.Pacific.Islander.Students..Private.School..2019.20",
+  prop_white = "Percentage.of.White.Students..Private.School..2019.20",
+  FTE_Teachers_Private_2019_20 = "Full.Time.Equivalent..FTE..Teachers..Private.School..2019.20",
+  Locale = "Locale..Private.School..2019.20"
+)
+private_school_char <- private_school_char %>% rename(!!!new_private_names)
+
+private_school_char <- private_school_char %>%
+  mutate(
+    PPIN = str_pad(as.character(PPIN), width = 8, side = "left", pad = "0"),
+    STATE_not_geo_file = str_trim(STATE_not_geo_file),
+    State_Name_Latest = str_trim(State_Name_Latest),
+    State_Name_2019_20 = str_trim(State_Name_2019_20)
+  )
+
+# Cap demographic proportions at 100
+private_school_char <- private_school_char %>%
+  mutate(across(c(prop_black, prop_hispanic, prop_native, prop_hawaiian, prop_asian, prop_white),
+                ~ pmin(100, .)))
+
+# Filter out schools with <=1 student or missing PPIN
+private_school_char <- private_school_char %>%
+  filter(!is.na(Total_Students_Private_2019_20) & Total_Students_Private_2019_20 > 1,
+         !is.na(PPIN) & PPIN != "")
+
+# Simplify locale codes into broader urbanicity categories
+private_school_char <- private_school_char %>%
+  mutate(
+    urbanicity_char_data = case_when(
+      substr(Locale, 1, 2) %in% c("11","12","13") ~ "city",
+      substr(Locale, 1, 2) %in% c("21","22","23") ~ "suburban",
+      substr(Locale, 1, 2) %in% c("31","32","33") ~ "town",
+      substr(Locale, 1, 2) %in% c("41","42","43") ~ "rural",
+      TRUE ~ NA_character_  # This ensures any other value is marked as NA
+    )
+  )
+
+# Merge geo and char datasets, preserve all geo schools
+private_school_combined <- private_school_geo %>%
+  left_join(private_school_char, by = "PPIN") %>%
+  # Recreate urbanicity based on LOCALE
+  mutate(
+    urbanicity_geo_data = case_when(
+      substr(LOCALE, 1, 2) %in% c("11","12","13") ~ "city",
+      substr(LOCALE, 1, 2) %in% c("21","22","23") ~ "suburban",
+      substr(LOCALE, 1, 2) %in% c("31","32","33") ~ "town",
+      substr(LOCALE, 1, 2) %in% c("41","42","43") ~ "rural",
+      TRUE ~ NA_character_
+    )
+  )
+
+private_school_combined <- private_school_combined %>%
+   select(
+     Private_School_Name, State_Name_Latest, State_Name_2019_20, STATE_not_geo_file, STATE,
+     Private_School_Name_2019_20, PPIN, Total_Students_Private_2019_20,
+     Black_Students_Private_2019_20, Hispanic_Students_Private_2019_20, Native_Students_Private_2019_20,
+     Hawaiian_Students_Private_2019_20, Asian_Students_Private_2019_20, White_Students_Private_2019_20,
+     prop_black, prop_hispanic, prop_native, prop_hawaiian, prop_asian, prop_white,
+     FTE_Teachers_Private_2019_20, LOCALE, urbanicity_geo_data, LAT, LON
+   ) %>%
+   mutate(
+     STATE = str_trim(STATE),
+     State_Name_Latest = str_trim(State_Name_Latest),
+     State_Name_2019_20 = str_trim(State_Name_2019_20),
+     urbanicity = urbanicity_geo_data
+   )
+
+# Inspect coordinates and urbanicity & locale coverage
+coord_after_join <- private_school_combined %>%
+  summarise(
+    has_coordinates = sum(!is.na(LAT) & !is.na(LON)),
+    missing_coordinates = sum(is.na(LAT) | is.na(LON)),
+    has_state = sum(!is.na(STATE)),
+    has_urbanicity = sum(!is.na(urbanicity)),
+    has_locale = sum(!is.na(LOCALE))
+  )
+
+cat("Schools with coordinates after join:", coord_after_join$has_coordinates, "\n")
+cat("Schools missing coordinates after join:", coord_after_join$missing_coordinates, "\n")
+cat("Schools with state:", coord_after_join$has_state, "\n")
+cat("Schools with urbanicity:", coord_after_join$has_urbanicity, "\n")
+cat("Schools with locale:", coord_after_join$has_locale, "\n")
+
+private_school_combined %>% filter(STATE_not_geo_file != STATE) %>% print()
+```
+
+```{r}
+# -------------------------------
+# Data Validation Checks
+# -------------------------------
+
+cat("\n===== PUBLIC SCHOOL VALIDATION =====\n")
+
+# 1️⃣ Missing CRDC join
+missing_crdc <- public_school_combined %>%
+  filter(is.na(SCH_NAME) & !is.na(School_ID)) %>% nrow()
+cat("1️⃣ Rows with missing CRDC join:", missing_crdc, "\n")
+
+# 2️⃣ Missing urbanicity
+missing_urbanicity <- sum(is.na(public_school_combined$urbanicity))
+cat("2️⃣ Rows with missing urbanicity:", missing_urbanicity, "\n")
+
+# 3️⃣ Missing coordinates
+cat("3️⃣ Public: Missing Lat/Long =", 
+    sum(is.na(public_school_combined$Latitude) | is.na(public_school_combined$Longitude)), "\n")
+
+# 4️⃣ Proportion ranges
+cat("4️⃣ Public proportion summaries (min, median, max, NA count):\n")
+print(summary(select(public_school_combined, prop_frl, prop_black, prop_hispanic, prop_white)))
+
+# 5️⃣ Duplicate School_IDs
+dup_public <- public_school_combined %>% count(School_ID) %>% filter(n > 1) %>% nrow()
+cat("5️⃣ Duplicate School_IDs (public):", dup_public, "\n")
+
+# 6️⃣ Missing School_IDs
+missing_ids_public <- public_school_combined %>% filter(is.na(School_ID) | School_ID == "") %>% nrow()
+cat("6️⃣ Public rows missing School_ID:", missing_ids_public, "\n")
+
+# 7️⃣ Total number of rows/columns
+cat("7️⃣ Public dataset shape: Rows =", nrow(public_school_combined),
+    "| Columns =", ncol(public_school_combined), "\n")
+
+cat("\n===== PRIVATE SCHOOL VALIDATION =====\n")
+
+# 8️⃣ Missing coordinates after join
+missing_geo <- private_school_combined %>% filter(is.na(LAT) | is.na(LON)) %>% nrow()
+cat("8️⃣ Private: Missing coordinates after join:", missing_geo, "\n")
+
+# 9️⃣ Proportion ranges, duplicates, and missing PPINs
+cat("9️⃣ Private proportion summaries (min, median, max, NA count):\n")
+print(summary(select(private_school_combined, prop_black, prop_hispanic, prop_white)))
+
+dup_private <- private_school_combined %>% count(PPIN) %>% filter(n > 1) %>% nrow()
+missing_ids_private <- private_school_combined %>% filter(is.na(PPIN) | PPIN == "") %>% nrow()
+cat("   Duplicate PPINs (private):", dup_private, "\n")
+cat("   Missing PPIN values:", missing_ids_private, "\n")
+
+# Final summary
+cat("\nPrivate dataset shape: Rows =", nrow(private_school_combined),
+    "| Columns =", ncol(private_school_combined), "\n")
+cat("\n===== VALIDATION COMPLETE =====\n")
+
+```
+
+```{r}
+# -------------------------------
+# Export cleaned datasets
+# -------------------------------
+
+write.csv(public_school_combined, 
+          "Data/Schools/Public/public_school_combined.csv", 
+          row.names = FALSE)
+
+write.csv(private_school_combined, 
+          "Data/Schools/Private/private_school_combined.csv", 
+          row.names = FALSE)
+
+```
+
+```{r}
+# Brownfields
+
+brownfield_sites = read.csv("Data/Pollution Sites/Brownfield/CIMC Basic Search Result.csv")
+brownfield_geo <- read.csv("Data/Pollution Sites/Brownfield/More BF Table.csv")
+
+# Using sub() to remove everything before the ID
+brownfield_sites$Brownfield_ID <- sub(".*P31_ID:", "", brownfield_sites$Brownfields.Link.CSV)
+brownfield_sites$Registry_ID <- sub(".*p_registry_id=", "", brownfield_sites$FRS.Link.CSV)
+
+brownfield_geo$Brownfield_ID = as.character(brownfield_geo$Property.ID)
+
+# Remove duplicates in site file based on Brownfield ID
+brownfield_sites <- brownfield_sites %>%
+  distinct(Brownfield_ID, .keep_all = TRUE)
+
+# Remove duplicates in geo file based on Brownfield ID
+brownfield_geo <- brownfield_geo %>%
+  distinct(Brownfield_ID, .keep_all = TRUE)
+
+# Find matching Brownfield IDs
+matching_ids <- intersect(brownfield_sites$Brownfield_ID, brownfield_geo$Brownfield_ID)
+# Count how many matches there are
+num_matches <- length(matching_ids)
+cat("Number of Brownfield IDs present in both files:", num_matches, "\n")
+
+# Join site and geo files
+brownfield = left_join(brownfield_sites, brownfield_geo, by = c("Brownfield_ID"))
+write.csv(brownfield, "Data/Pollution Sites/Brownfield/brownfield_sites.csv")
+
+```
+
